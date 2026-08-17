@@ -176,6 +176,21 @@ def run_agent(
             if extra_calls:
                 comp.content = extra_content
                 comp.tool_calls = extra_calls
+        elif native_tools and comp.tool_calls:
+            valid = []
+            for tc in comp.tool_calls:
+                args = tc.arguments if isinstance(tc, ToolCall) else (tc.get("function") or {}).get("arguments") or tc.get("arguments") or {}
+                if isinstance(args, dict) and args:
+                    valid.append(tc)
+            if not valid and comp.content:
+                extra_content, extra_calls = parse_text_tool_calls(comp.content)
+                if extra_calls:
+                    comp.content = extra_content
+                    comp.tool_calls = extra_calls
+                else:
+                    comp.tool_calls = []
+            elif valid:
+                comp.tool_calls = valid
 
         messages.append(_assistant_message(comp))
         last = (comp.content or "").strip()
