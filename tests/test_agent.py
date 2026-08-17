@@ -120,6 +120,21 @@ class ToolsTests(unittest.TestCase):
         out = self.tools.docs("not-a-real-alias")
         self.assertIn("unknown source", out)
 
+    def test_missing_args_error(self):
+        from lightlx.agent.loop import _run_one
+        spec = self.tools._spec("edit_file", "d", {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        }, self.tools.edit_file)
+        out = _run_one(spec, {})
+        self.assertIn("missing required argument", out)
+        self.assertIn("path", out)
+
 
 class PromptTests(unittest.TestCase):
     def test_system_mentions_workspace(self):

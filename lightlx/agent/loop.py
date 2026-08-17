@@ -44,10 +44,24 @@ def _lookup(registry, name):
 
 
 def _run_one(spec, args):
+    args = args or {}
     try:
         return spec.handler(**(args or {}))
     except TypeError:
-        return spec.handler(**{k: v for k, v in (args or {}).items() if k in (spec.parameters.get("properties") or {})})
+        props = (spec.parameters or {}).get("properties") or {}
+        filtered = {k: v for k, v in (args or {}).items() if k in props}
+        try:
+            return spec.handler(**filtered)
+        except TypeError as e:
+            req = (spec.parameters or {}).get("required") or []
+            missing = [r for r in req if not (args or {}).get(r)]
+            if missing:
+                got = ", ".join(sorted(args or {})) or "(none)"
+                return (
+                    f"error: {spec.name} missing required argument(s): {', '.join(missing)}. "
+                    f"got: {got}. provide all of: {', '.join(req)}."
+                )
+            return f"error: {e}"
     except Exception as e:
         return f"error: {e}\n{traceback.format_exc()[-800:]}"
 
@@ -176,6 +190,29 @@ def run_agent(
             if extra_calls:
                 comp.content = extra_content
                 comp.tool_calls = extra_calls
+
+        if native_tools and comp.tool_calls:
+            bad = []
+            for tc in comp.tool_calls:
+                name = getattr(tc, "name", None) or tc.get("name")
+                spec = _lookup(registry, name)
+                args = tc.arguments if isinstance(tc, ToolCall) else {}
+                req = (getattr(spec, "parameters", None) or {}).get("required") or [] if spec else []
+                missing = [r for r in req if not (args or {}).get(r)]
+                if missing:
+                    bad.append(f"{name} (missing {', '.join(missing)})")
+            if bad:
+                if on_event:
+                    on_event("text", text="\n", depth=depth)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your tool call(s) had empty or missing required arguments: " + "; ".join(bad) + ". "
+                        "Re-issue the call with all required arguments filled in — e.g. edit_file needs "
+                        "path, old_string, new_string; task needs description and prompt."
+                    ),
+                })
+                continue
 
         messages.append(_assistant_message(comp))
         last = (comp.content or "").strip()
