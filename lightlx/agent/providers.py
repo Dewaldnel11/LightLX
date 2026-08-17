@@ -220,8 +220,15 @@ class StreamAcc:
                 fn = tc.get("function") or {}
                 if fn.get("name"):
                     slot["name"] += fn["name"]
-                if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
+                args = fn.get("arguments")
+                if args is not None:
+                    if isinstance(args, str):
+                        slot["arguments"] += args
+                    elif isinstance(args, dict):
+                        # Some servers send arguments as object per chunk; merge
+                        existing = parse_args(slot["arguments"])
+                        existing.update(args)
+                        slot["arguments"] = json.dumps(existing)
         blob = "".join(self.content)
         if is_repeating(blob) or is_repeating("".join(self.reasoning)):
             self.looped = True
