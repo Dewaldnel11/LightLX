@@ -342,7 +342,7 @@ class SubagentLauncher:
                 max_tokens=self.max_tokens, max_iters=20,
                 temperature=self.temperature, on_event=self.on_event,
                 depth=1, native_tools=self.native_tools,
-                deadline=time.time() + 180,
+                deadline=time.time() + 600,
             )
         except Exception as e:
             if self.on_event:
