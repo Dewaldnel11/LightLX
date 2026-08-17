@@ -138,6 +138,7 @@ def _indent(depth):
 def make_printer():
     started = {"n": False}
     tool_stack = {}
+    read_group = {"active": False, "names": []}
 
     def on_event(kind, text="", name="", detail="", depth=0, ok=True, **_):
         pad = "  " + ("  " * depth)
@@ -152,7 +153,12 @@ def make_printer():
                 print()
                 started["n"] = False
             tool_stack[name] = {"detail": detail or name, "t0": time.time()}
-            print(_dim(f"{pad}▸ {detail or name}"))
+            if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
+                read_group["active"] = True
+                read_group["names"].append(detail or name)
+                _render_read_group(pad)
+            else:
+                print(_dim(f"{pad}▸ {detail or name}"))
         elif kind == "tool_end":
             if started["n"]:
                 print()
@@ -161,7 +167,16 @@ def make_printer():
             dur = time.time() - info.get("t0", time.time())
             mark = _ok("✓") if ok else _err("✗")
             tail = f" {_dim(f'{dur:.1f}s')}" if dur > 0.2 else ""
-            print(_dim(f"{pad}{mark} {info.get('detail', name)}{tail}"))
+            if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
+                read_group["names"] = [n for n in read_group["names"] if n != (detail or name)]
+                if not read_group["names"]:
+                    read_group["active"] = False
+                    sys.stdout.write("\033[K")
+                    sys.stdout.flush()
+                else:
+                    _render_read_group(pad)
+            else:
+                print(_dim(f"{pad}{mark} {info.get('detail', name)}{tail}"))
         elif kind == "subagent_start":
             if started["n"]:
                 print()
@@ -184,9 +199,23 @@ def make_printer():
                 print()
                 started["n"] = False
 
+    def _render_read_group(pad):
+        names = read_group["names"]
+        if len(names) == 1:
+            label = names[0]
+        elif len(names) <= 3:
+            label = ", ".join(names)
+        else:
+            label = f"{', '.join(names[:2])} +{len(names)-2} more"
+        line = f"{pad}▸ reading {label}"
+        sys.stdout.write("\033[K" + line + "\033[" + str(len(line)) + "D")
+        sys.stdout.flush()
+
     def reset():
         started["n"] = False
         tool_stack.clear()
+        read_group["active"] = False
+        read_group["names"] = []
 
     on_event.reset = reset
     return on_event
