@@ -161,6 +161,24 @@ class ParseArgsTests(unittest.TestCase):
         for m in out:
             self.assertIsInstance(m.get("content"), (str, type(None)))
 
+    def test_to_openai_dict_tool_calls(self):
+        from lightlx.agent.providers import to_openai_messages
+        msgs = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "name": "edit_file",
+                "arguments": {"path": "a.py", "old_string": "x", "new_string": "y"},
+            }],
+        }]
+        out = to_openai_messages(msgs)
+        tc = out[0]["tool_calls"][0]
+        self.assertEqual(tc["function"]["name"], "edit_file")
+        self.assertIsInstance(tc["function"]["arguments"], str)
+        self.assertIn("a.py", tc["function"]["arguments"])
+
 
 class ContextTests(unittest.TestCase):
     def test_estimate_and_threshold(self):

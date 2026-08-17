@@ -441,6 +441,16 @@ def _to_ollama_messages(messages):
                         "type": "function",
                         "function": {"name": tc.name, "arguments": tc.arguments},
                     })
+                elif isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    item["tool_calls"].append({
+                        "id": tc.get("id") or "",
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name") or tc.get("name") or "",
+                            "arguments": fn.get("arguments") or tc.get("arguments") or {},
+                        },
+                    })
                 else:
                     item["tool_calls"].append(tc)
         out.append(item)
@@ -497,6 +507,12 @@ def flatten_for_chat(messages):
             for tc in m["tool_calls"]:
                 if isinstance(tc, ToolCall):
                     payload = {"name": tc.name, "arguments": tc.arguments}
+                elif isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    payload = {
+                        "name": fn.get("name") or tc.get("name") or "",
+                        "arguments": fn.get("arguments") or tc.get("arguments") or {},
+                    }
                 else:
                     fn = (tc.get("function") or {})
                     payload = {"name": fn.get("name"), "arguments": parse_args(fn.get("arguments"))}
@@ -518,6 +534,17 @@ def to_openai_messages(messages):
                         "id": tc.id,
                         "type": "function",
                         "function": {"name": tc.name, "arguments": tc.raw_arguments or json.dumps(tc.arguments)},
+                    })
+                elif isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = fn.get("name") or tc.get("name") or ""
+                    args = fn.get("arguments") or tc.get("arguments") or tc.get("raw_arguments") or ""
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    item["tool_calls"].append({
+                        "id": tc.get("id") or "",
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
                     })
                 else:
                     item["tool_calls"].append(tc)
