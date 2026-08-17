@@ -36,12 +36,7 @@ def _call(name, arguments, raw=""):
 
 
 _NARRATE = re.compile(
-    r"\b(let me (read|check|look|open|inspect|see|add|implement|write|create|fix|update|modify|review|"
-    r"refactor|move|rename|delete|start|begin)|"
-    r"(now|next|then|first|finally),? (let me|i('ll| will)|i'm going to)|"
-    r"i('ll| will|'m going to|m going to) (read|check|look|open|add|implement|write|create|fix|update|"
-    r"modify|review|refactor|start|begin)|"
-    r"reading (the |more )?files|i('m| am) going to (read|check|look))\b",
+    r"\b(let me (read|check|look|open|inspect|see|add|implement|write|create|fix|update|modify|review|refactor|move|rename|delete|start|begin)|(now|next|then|first|finally),? (let me|i('ll| will)|i'm going to)|i('ll| will|'m going to|m going to) (read|check|look|open|add|implement|write|create|fix|update|modify|review|refactor|start|begin)|reading (the |more )?files|i('m| am) going to (read|check|look)|a subagent (is|was) (working|running)|(subagent|task) (is|was) (working|running|underway)|i (am|have) (awaiting|waiting for) (reports?|results?)|(the|this|my) (subagent|task) (is|has) (completed|finished|done|started)|parallel subagents? (are|were) (working|running)|(implementation|work|audit) (is|was) (currently )?(underway|in progress)|i (have|'ve) (applied|made|implemented) (edits?|changes?|fixes?))",
     re.I,
 )
 _NUM_PLAN = re.compile(

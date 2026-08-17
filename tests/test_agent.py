@@ -22,6 +22,10 @@ class RepeatTests(unittest.TestCase):
         self.assertTrue(looks_like_tool_narration("Now let me add the audit log querying functionality:"))
         self.assertTrue(looks_like_tool_narration("Next, I'll implement the retry logic in ScannerBridge."))
         self.assertTrue(looks_like_tool_narration("1. records.py\n2. audit.py\n3. policy.py"))
+        self.assertTrue(looks_like_tool_narration("A subagent is working on the fix"))
+        self.assertTrue(looks_like_tool_narration("I am awaiting reports from these subagents"))
+        self.assertTrue(looks_like_tool_narration("The implementation is currently underway via parallel subagents"))
+        self.assertTrue(looks_like_tool_narration("I have applied edits to the scan bridge"))
 
 
 class ParseTests(unittest.TestCase):
