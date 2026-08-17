@@ -206,7 +206,8 @@ class BuiltinTools:
         if include_task and self.launch_task:
             out.append(self._spec(
                 "task",
-                "Launch a subagent for a big or long-horizon job. Several task calls in one turn run in parallel. "
+                "Launch a subagent for a big or long-horizon job. Several task calls in the SAME turn run in PARALLEL — "
+                "for a large task, issue multiple task calls together (one per area) instead of one big one. "
                 "explore = read-only research; implement = can edit files; general = full tools. "
                 "Subagents cannot spawn further subagents. Tell them exactly what to return.",
                 {

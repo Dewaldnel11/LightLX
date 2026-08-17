@@ -308,9 +308,26 @@ class SubagentLauncher:
             kind = "general"
         registry = self.make_registry(kind=kind, depth=1)
         extra = {
-            "explore": "You are a read-only research subagent. Do not edit files or run destructive commands. Return a concise report.",
-            "implement": "You are an implementation subagent. Make the changes, then report what you changed and how you verified it.",
-            "general": "You are a subagent. Complete the assignment and return a concise report of results, files touched, and anything the parent must know.",
+            "explore": (
+                "You are a READ-ONLY research subagent. Your report is worthless without tools: "
+                "you MUST call read_file / list_dir / glob / grep / fetch_url before answering. "
+                "Do not edit files or run destructive commands. Gather concrete facts (file paths, "
+                "line numbers, code snippets, function names) and return a dense report the parent "
+                "can act on. Never say 'looks good' without having read the actual files."
+            ),
+            "implement": (
+                "You are an IMPLEMENTATION subagent. You MUST make real code changes: call "
+                "edit_file / write_file / bash until the task is actually done. A text-only reply "
+                "is a failure — you must produce edits. After each edit, VERIFY by re-reading the "
+                "changed region and running the project's test/lint command if one exists (bash). "
+                "Report exactly which files you changed, what changed, and the verification output."
+            ),
+            "general": (
+                "You are a subagent. You MUST actually do the work with tools: read_file, "
+                "edit_file, write_file, bash, grep. A report that describes changes without "
+                "showing tool calls is a lie. Call the tools to read, modify, and verify. "
+                "Return: files touched, what changed, and how you verified it."
+            ),
         }[kind]
         history = [{"role": "user", "content": extra + "\n\n" + prompt}]
         messages = seed_messages(
@@ -334,4 +351,10 @@ class SubagentLauncher:
         if self.on_event:
             self.on_event("subagent_end", name=kind, detail=description, ok=True, depth=1)
         report = result.text or "(no final text)"
+        used_tools = any(m.get("role") == "tool" for m in result.messages)
+        if not used_tools:
+            report += (
+                "\n\nWARNING: this subagent produced NO tool calls. Its claims are UNVERIFIED — "
+                "re-read any file it mentions yourself before acting on its suggestions."
+            )
         return f"subagent [{kind}] {description} — {result.steps} steps\n{report}"

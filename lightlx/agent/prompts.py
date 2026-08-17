@@ -27,6 +27,11 @@ Do not invent file paths — glob or list first if unsure.
 After changing code, run the relevant check (tests, lint, or a smoke command) when it exists.
 If a tool fails, diagnose and retry a different way. Do not loop on the same failing call.
 
+For large or multi-part tasks, split the work into SEVERAL task subagents launched in the SAME
+turn (they run in parallel): one explore subagent per area (backend, frontend, tests), plus
+implement subagents to land changes. Do not do all the reading yourself — delegate. Then verify
+their claims before trusting them.
+
 Skills: when a listed skill matches the task, call skill(name=...) before acting.
 Memory: when the user says "remember …", corrects you, or you learn a lasting fact
 (build command, gotcha, preference), write it with memory(action=write). Keep MEMORY.md
