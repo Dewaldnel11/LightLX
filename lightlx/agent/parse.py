@@ -36,9 +36,17 @@ def _call(name, arguments, raw=""):
 
 
 _NARRATE = re.compile(
-    r"\b(let me (read|check|look|open|inspect|see)|i('ll| will) (read|check|look|open)|"
+    r"\b(let me (read|check|look|open|inspect|see|add|implement|write|create|fix|update|modify|review|"
+    r"refactor|move|rename|delete|start|begin)|"
+    r"(now|next|then|first|finally),? (let me|i('ll| will)|i'm going to)|"
+    r"i('ll| will|'m going to|m going to) (read|check|look|open|add|implement|write|create|fix|update|"
+    r"modify|review|refactor|start|begin)|"
     r"reading (the |more )?files|i('m| am) going to (read|check|look))\b",
     re.I,
+)
+_NUM_PLAN = re.compile(
+    r"^(\d+[\.\)]\s+.*\.(py|swift|js|ts|json|md|toml|cfg|txt)\s*){2,}$",
+    re.MULTILINE | re.I,
 )
 
 
@@ -76,7 +84,11 @@ def looks_like_tool_narration(text: str) -> bool:
     t = (text or "").strip()
     if not t or len(t) > 1200:
         return False
-    return bool(_NARRATE.search(t))
+    if _NARRATE.search(t):
+        return True
+    if _NUM_PLAN.search(t) and len(t) < 600:
+        return True
+    return False
 
 
 def parse_text_tool_calls(text: str):

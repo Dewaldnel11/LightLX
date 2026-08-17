@@ -19,6 +19,9 @@ class RepeatTests(unittest.TestCase):
         self.assertEqual(collapse_repeats(looped), "Let me read more files.")
         self.assertTrue(looks_like_tool_narration("Let me read the scan_bridge.py"))
         self.assertFalse(looks_like_tool_narration("Here is the improvement plan:\n1. tests\n2. UI"))
+        self.assertTrue(looks_like_tool_narration("Now let me add the audit log querying functionality:"))
+        self.assertTrue(looks_like_tool_narration("Next, I'll implement the retry logic in ScannerBridge."))
+        self.assertTrue(looks_like_tool_narration("1. records.py\n2. audit.py\n3. policy.py"))
 
 
 class ParseTests(unittest.TestCase):

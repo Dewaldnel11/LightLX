@@ -124,7 +124,7 @@ def run_agent(
     last = ""
     steps = 0
     nudged = False
-    narrate_nudge = False
+    narrate_nudges = 0
     ctx = context_length or getattr(provider, "context_length", None)
     read_tools = {"read_file", "list_dir", "glob", "grep", "fetch_url", "docs"}
     write_tools = {"write_file", "edit_file", "bash"}
@@ -186,13 +186,18 @@ def run_agent(
             on_event("text", text=last, depth=depth)
         if not comp.tool_calls:
             used_tools = any(m.get("role") == "tool" for m in messages)
-            if looks_like_tool_narration(last) and not narrate_nudge:
-                narrate_nudge = True
+            if looks_like_tool_narration(last) and narrate_nudges < 3:
+                narrate_nudges += 1
                 if on_event:
                     on_event("text", text="\n", depth=depth)
                 messages.append({
                     "role": "user",
-                    "content": "Do not narrate. Call the tools now (read_file / list_dir / grep). No more 'let me read' text.",
+                    "content": (
+                        f"STOP NARRATING (strike {narrate_nudges}). "
+                        "Never write sentences like 'Now let me add…' or 'I'll read…'. "
+                        "Call the tool (read_file / list_dir / grep / edit_file / write_file) NOW. "
+                        "No prose before tool calls."
+                    ),
                 })
                 continue
             if not last and used_tools and not nudged:
