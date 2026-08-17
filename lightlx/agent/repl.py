@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 from .context import detect_context, estimate_tokens, handoff_note, maybe_compact
 from .loop import SubagentLauncher, run_agent, seed_messages
@@ -131,6 +132,7 @@ def _indent(depth):
 
 def make_printer():
     started = {"n": False}
+    tool_stack = {}
 
     def on_event(kind, text="", name="", detail="", depth=0, ok=True, **_):
         pad = _indent(depth)
@@ -144,10 +146,17 @@ def make_printer():
             if started["n"]:
                 print()
                 started["n"] = False
-            print(_dim(f"{pad}→ {detail or name}"))
+            tool_stack[name] = {"detail": detail or name, "t0": time.time()}
+            print(_dim(f"{pad}▸ {detail or name}"))
         elif kind == "tool_end":
+            if started["n"]:
+                print()
+                started["n"] = False
+            info = tool_stack.pop(name, {})
+            dur = time.time() - info.get("t0", time.time())
             mark = _ok("✓") if ok else _err("✗")
-            print(_dim(f"{pad}{mark} {detail or name}"))
+            tail = f" {_dim(f'({dur:.1f}s)')}" if dur > 0.2 else ""
+            print(_dim(f"{pad}{mark} {info.get('detail', name)}{tail}"))
         elif kind == "subagent_start":
             if started["n"]:
                 print()
@@ -160,7 +169,7 @@ def make_printer():
             if started["n"]:
                 print()
                 started["n"] = False
-            print(_dim(f"{pad}◎ compacting context · {detail}"))
+            print(_dim(f"{pad}◎ compacting · {detail}"))
         elif kind == "compact_done":
             print(_dim(f"{pad}◎ compacted"))
         elif kind == "error":
@@ -172,6 +181,7 @@ def make_printer():
 
     def reset():
         started["n"] = False
+        tool_stack.clear()
 
     on_event.reset = reset
     return on_event

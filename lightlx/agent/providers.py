@@ -4,6 +4,7 @@ import uuid
 import urllib.error
 import urllib.request
 
+from .parse import collapse_repeats, is_repeating
 from .types import Completion, ToolCall
 
 UA = "lightlx/0.2.0"
@@ -150,6 +151,22 @@ def _lms_cli_probe():
     return {"url": f"http://127.0.0.1:{port}", "models": models, "via": "lms"}
 
 
+def message_text(val):
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        parts = []
+        for p in val:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                parts.append(p.get("text") or p.get("content") or "")
+        return "".join(parts)
+    return str(val)
+
+
 def parse_args(raw):
     if isinstance(raw, dict):
         return raw
@@ -180,16 +197,21 @@ def _tool_calls_from_openai(message):
 class StreamAcc:
     def __init__(self):
         self.content = []
+        self.reasoning = []
         self.tools = {}
+        self.looped = False
 
     def feed(self, chunk):
         pieces = []
         for c in chunk.get("choices") or []:
-            d = c.get("delta") or {}
-            text = d.get("content")
+            d = c.get("delta") or c.get("message") or {}
+            text = message_text(d.get("content"))
+            think = message_text(d.get("reasoning_content") or d.get("reasoning") or d.get("thinking"))
             if text:
                 self.content.append(text)
                 pieces.append(text)
+            if think:
+                self.reasoning.append(think)
             for tc in d.get("tool_calls") or []:
                 i = tc.get("index", 0)
                 slot = self.tools.setdefault(i, {"id": "", "name": "", "arguments": ""})
@@ -200,6 +222,10 @@ class StreamAcc:
                     slot["name"] += fn["name"]
                 if fn.get("arguments"):
                     slot["arguments"] += fn["arguments"]
+        blob = "".join(self.content)
+        if is_repeating(blob) or is_repeating("".join(self.reasoning)):
+            self.looped = True
+            pieces = []
         return "".join(pieces)
 
     def result(self, finish="stop"):
@@ -214,7 +240,10 @@ class StreamAcc:
                 arguments=parse_args(slot["arguments"]),
                 raw_arguments=slot["arguments"],
             ))
-        return Completion("".join(self.content), calls, "tool_calls" if calls else finish)
+        text = collapse_repeats("".join(self.content))
+        if not text and not calls:
+            text = collapse_repeats("".join(self.reasoning))
+        return Completion(text, calls, "tool_calls" if calls else finish)
 
 
 class OpenAICompat:
@@ -230,11 +259,14 @@ class OpenAICompat:
         self.context_length = 0
 
     def complete(self, messages, tools=None, max_tokens=4096, temperature=0.2, on_text=None):
+        from .context import sanitize_messages
+        messages = sanitize_messages(messages)
         body = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "frequency_penalty": 0.4,
             "stream": True,
         }
         if tools:
@@ -249,7 +281,9 @@ class OpenAICompat:
             body["stream"] = False
             data, _ = http_json("POST", url, body, _headers(self.api_key), timeout=self.timeout or 600)
             msg = ((data.get("choices") or [{}])[0].get("message")) or {}
-            content = msg.get("content") or ""
+            content = message_text(msg.get("content")) or message_text(
+                msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thinking")
+            )
             if on_text and content:
                 on_text(content)
             calls = _tool_calls_from_openai(msg)
@@ -285,6 +319,8 @@ class OpenAICompat:
                         piece = acc.feed(data)
                         if piece and on_text:
                             on_text(piece)
+                        if acc.looped:
+                            return acc.result("stop")
                         for c in data.get("choices") or []:
                             if c.get("finish_reason"):
                                 finish = c["finish_reason"]

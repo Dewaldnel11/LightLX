@@ -161,6 +161,35 @@ def _blob(messages) -> str:
     return "\n\n".join(parts)
 
 
+def sanitize_messages(messages):
+    out = []
+    pending = set()
+    for m in messages or []:
+        role = m.get("role")
+        if role == "tool":
+            tid = m.get("tool_call_id") or ""
+            if tid in pending:
+                out.append(m)
+                pending.discard(tid)
+            continue
+        pending = set()
+        if role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                if hasattr(tc, "id"):
+                    pending.add(tc.id)
+                elif isinstance(tc, dict) and tc.get("id"):
+                    pending.add(tc["id"])
+        out.append(m)
+    return out
+
+
+def _split_keep(rest, keep):
+    cut = max(0, len(rest) - keep)
+    while cut < len(rest) and rest[cut].get("role") == "tool":
+        cut += 1
+    return rest[:cut], rest[cut:]
+
+
 def compact_messages(provider, messages, *, keep=KEEP_RECENT, max_tokens=1024, on_event=None):
     if len(messages) <= keep + 1:
         return messages, False
@@ -170,7 +199,7 @@ def compact_messages(provider, messages, *, keep=KEEP_RECENT, max_tokens=1024, o
         head = [rest.pop(0)]
     if len(rest) <= keep:
         return messages, False
-    old, recent = rest[:-keep], rest[-keep:]
+    old, recent = _split_keep(rest, keep)
     if on_event:
         on_event("compact", detail=f"{estimate_tokens(old)} tok → summary")
     try:
@@ -190,7 +219,15 @@ def compact_messages(provider, messages, *, keep=KEEP_RECENT, max_tokens=1024, o
         {"role": "user", "content": "[compacted earlier conversation]\n" + summary},
         {"role": "assistant", "content": "Got it. I have the compacted context and will continue."},
     ] + recent
-    return compacted, True
+    if compacted and compacted[-1].get("role") in ("tool", "assistant"):
+        compacted.append({
+            "role": "user",
+            "content": (
+                "Continue the user's request. Write the answer or plan now from what you already know. "
+                "Only use a tool if a critical fact is still missing."
+            ),
+        })
+    return sanitize_messages(compacted), True
 
 
 def maybe_compact(provider, messages, context_length, max_tokens, on_event=None, force=False):

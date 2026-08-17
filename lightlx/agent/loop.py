@@ -2,7 +2,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .context import maybe_compact
-from .parse import parse_text_tool_calls
+from .parse import looks_like_tool_narration, parse_text_tool_calls
 from .prompts import format_tool_list, system_prompt
 from .providers import to_openai_messages
 from .tools import summarize_call
@@ -97,6 +97,8 @@ def run_agent(
     tools = [s.openai_tool() for s in registry.values()] if native_tools else None
     last = ""
     steps = 0
+    nudged = False
+    narrate_nudge = False
     ctx = context_length or getattr(provider, "context_length", None)
     for _ in range(max_iters):
         steps += 1
@@ -131,6 +133,26 @@ def run_agent(
         messages.append(_assistant_message(comp))
         last = (comp.content or "").strip()
         if not comp.tool_calls:
+            used_tools = any(m.get("role") == "tool" for m in messages)
+            if looks_like_tool_narration(last) and not narrate_nudge:
+                narrate_nudge = True
+                if on_event:
+                    on_event("text", text="\n", depth=depth)
+                messages.append({
+                    "role": "user",
+                    "content": "Do not narrate. Call the tools now (read_file / list_dir / grep). No more 'let me read' text.",
+                })
+                continue
+            if not last and used_tools and not nudged:
+                nudged = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You already gathered information with tools. "
+                        "Now write a clear answer and plan for the user. Do not call tools."
+                    ),
+                })
+                continue
             if on_event:
                 on_event("turn_end", depth=depth)
             return AgentResult(last, messages, steps)

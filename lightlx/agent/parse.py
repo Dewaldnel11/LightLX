@@ -35,6 +35,50 @@ def _call(name, arguments, raw=""):
     )
 
 
+_NARRATE = re.compile(
+    r"\b(let me (read|check|look|open|inspect|see)|i('ll| will) (read|check|look|open)|"
+    r"reading (the |more )?files|i('m| am) going to (read|check|look))\b",
+    re.I,
+)
+
+
+def collapse_repeats(text: str) -> str:
+    text = text or ""
+    lines, out, seen = [], [], set()
+    for ln in text.splitlines():
+        key = " ".join(ln.split()).lower()
+        if not key:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ln.rstrip())
+    return "\n".join(out).strip()
+
+
+def is_repeating(text: str, min_hits=3) -> bool:
+    text = text or ""
+    if len(text) < 120:
+        return False
+    tail = text[-240:]
+    if text[:-80].count(tail[:80]) >= min_hits:
+        return True
+    lines = [ln.strip().lower() for ln in text.splitlines() if len(ln.strip()) > 20]
+    if not lines:
+        return False
+    last = lines[-1]
+    return lines.count(last) >= min_hits + 1
+
+
+def looks_like_tool_narration(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 1200:
+        return False
+    return bool(_NARRATE.search(t))
+
+
 def parse_text_tool_calls(text: str):
     text = text or ""
     calls = []

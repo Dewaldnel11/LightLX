@@ -11,6 +11,16 @@ from lightlx.agent.tools import BuiltinTools, Workspace, html_to_text, summarize
 from lightlx.agent.types import ToolSpec
 
 
+class RepeatTests(unittest.TestCase):
+    def test_collapse_and_detect(self):
+        from lightlx.agent.parse import collapse_repeats, is_repeating, looks_like_tool_narration
+        looped = "Let me read more files.\n\n" * 8
+        self.assertTrue(is_repeating(looped))
+        self.assertEqual(collapse_repeats(looped), "Let me read more files.")
+        self.assertTrue(looks_like_tool_narration("Let me read the scan_bridge.py"))
+        self.assertFalse(looks_like_tool_narration("Here is the improvement plan:\n1. tests\n2. UI"))
+
+
 class ParseTests(unittest.TestCase):
     def test_json_block(self):
         text = 'hello\n<tool_call>\n{"name": "read_file", "arguments": {"path": "a.py"}}\n</tool_call>\n'
@@ -134,6 +144,20 @@ class ContextTests(unittest.TestCase):
         self.assertIn("handoff", note["content"])
         self.assertIn("32768", note["content"])
 
+    def test_sanitize_drops_orphan_tools(self):
+        from lightlx.agent.context import sanitize_messages
+        from lightlx.agent.types import ToolCall
+        tc = ToolCall(id="c1", name="read_file", arguments={"path": "a"})
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "nope"},
+            {"role": "assistant", "content": "", "tool_calls": [tc]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "ok"},
+        ]
+        out = sanitize_messages(msgs)
+        self.assertEqual([m["role"] for m in out], ["user", "assistant", "tool"])
+        self.assertEqual(out[-1]["content"], "ok")
+
     def test_compact_keeps_recent(self):
         from lightlx.agent.context import compact_messages
         from lightlx.agent.types import Completion
@@ -149,7 +173,8 @@ class ContextTests(unittest.TestCase):
         out, did = compact_messages(Fake(), hist, keep=4)
         self.assertTrue(did)
         self.assertIn("compacted", out[0]["content"])
-        self.assertEqual(out[-1]["content"], "a9")
+        self.assertTrue(any(m.get("content") == "a9" for m in out))
+        self.assertIn("Continue", out[-1]["content"])
 
 
 class SessionStoreTests(unittest.TestCase):
