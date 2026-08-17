@@ -135,7 +135,7 @@ def make_printer():
     tool_stack = {}
 
     def on_event(kind, text="", name="", detail="", depth=0, ok=True, **_):
-        pad = _indent(depth)
+        pad = "  " + ("  " * depth)
         if kind == "text":
             if not started["n"]:
                 print()
@@ -155,16 +155,16 @@ def make_printer():
             info = tool_stack.pop(name, {})
             dur = time.time() - info.get("t0", time.time())
             mark = _ok("✓") if ok else _err("✗")
-            tail = f" {_dim(f'({dur:.1f}s)')}" if dur > 0.2 else ""
+            tail = f" {_dim(f'{dur:.1f}s')}" if dur > 0.2 else ""
             print(_dim(f"{pad}{mark} {info.get('detail', name)}{tail}"))
         elif kind == "subagent_start":
             if started["n"]:
                 print()
                 started["n"] = False
-            print(_dim(f"{pad}▸ subagent {name} · {detail}"))
+            print(_dim(f"{pad}▸ subagent {detail}"))
         elif kind == "subagent_end":
             mark = _ok("✓") if ok else _err("✗")
-            print(_dim(f"{pad}{mark} subagent {name} · {detail}"))
+            print(_dim(f"{pad}{mark} subagent {detail}"))
         elif kind == "compact":
             if started["n"]:
                 print()
@@ -242,23 +242,21 @@ def run_turn(sess, user_text, on_event):
 
 
 def _prompt_line(sess):
-    n = len(sess.make_registry())
     used = estimate_tokens(sess.history)
     ctx = sess.context_length or 0
     ctx_s = f"{used}/{ctx}" if ctx else str(used)
-    chips = f"{sess.provider.kind} · agent · {n} tools · {ctx_s}"
-    return "\n" + _dim(chips) + "  " + _bold(sess.provider.label) + " " + _bold("›") + " "
+    return "\n" + _dim(f"{ctx_s}") + "  " + _bold(sess.provider.label) + " " + _bold("›") + " "
 
 
 def settings_menu(sess):
     while True:
-        print("\n  " + _bold("Settings") + _dim("   number to change · Enter for back"))
-        print(f"   1  Reply length   {_bold(str(sess.max_tokens))} {_dim('tokens')}")
+        print("\n  " + _bold("Settings") + _dim("   number · Enter to back"))
+        print(f"   1  Reply length   {_bold(str(sess.max_tokens))}")
         print(f"   2  Workspace      {_dim(str(sess.ws.root))}")
-        print(f"   3  Handoff model  {_dim('keeps this conversation')}")
+        print(f"   3  Handoff model")
         print(f"   4  Reload MCP     {_dim(str(len(sess.hub.servers)) + ' connected')}")
-        print(f"   5  Compact now    {_dim(str(estimate_tokens(sess.history)) + ' / ' + str(sess.context_length) + ' tok')}")
-        print("   q  Quit LightLX")
+        print(f"   5  Compact now    {_dim(str(estimate_tokens(sess.history)) + ' / ' + str(sess.context_length))}")
+        print("   q  Quit")
         try:
             c = input("  " + _bold("›") + " ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -279,7 +277,7 @@ def settings_menu(sess):
             return "switch"
         elif c == "4":
             sess._connect_mcp()
-            print(_dim("  MCP reloaded — " + (", ".join(sess.hub.summary()) or "no servers")))
+            print(_dim("  MCP reloaded"))
         elif c == "5":
             _do_compact(sess)
         elif c in ("q", "quit"):
@@ -398,18 +396,10 @@ def apply_record(sess, rec):
 
 
 def agent_repl(sess, switch_cb=None):
-    n = len(sess.make_registry())
-    mcp_n = len(sess.hub.servers)
-    extra = f" · {mcp_n} MCP" if mcp_n else ""
     ctx = sess.context_length
-    sk_n = len(sess.skills)
-    mem = " · memory" if sess.memory.load_index() else ""
-    instr = f" · {len(sess.instructions)} md" if sess.instructions else ""
-    print(_dim(f"\n  {sess.provider.label} · agent · {n} tools · {sk_n} skills{instr}{mem}{extra} · ctx {ctx}"))
+    print(_dim(f"\n  {sess.provider.label}  ·  ctx {ctx}"))
     print(_dim(f"  {sess.ws.root}"))
-    print(_dim("  message the model, or /menu · /skills · /memory · /help · /exit"))
-    if mcp_n:
-        print(_dim("  MCP: " + ", ".join(sess.hub.summary())))
+    print(_dim("  /menu · /skills · /memory · /help · /exit"))
     printer = make_printer()
     while True:
         try:
