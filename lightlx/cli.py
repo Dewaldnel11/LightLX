@@ -1,11 +1,7 @@
-# LightLX CLI — fully input-driven. No flags required, ever:
+# LightLX CLI — fully input-driven. No flags:
 #
-#   lightlx          → pick a model (remembers recent ones), then chat
-#
-# Flags still exist for scripting/power use, but the default experience is a
-# guided, menu-driven session that remembers your models and preferences.
+#   lightlx          → menus and questions, then chat / agent
 
-import argparse
 import json
 import os
 import sys
@@ -14,13 +10,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-import mlx.core as mx
-from transformers import AutoTokenizer
-
-from mlx_lm.models.glm_moe_dsa import ModelArgs
-
-from .model import StreamingGLM
-from .state import add_recent, load_state, save_state
+from .state import add_recent, add_recent_source, load_state, save_state
 
 BANNER = r"""
   _    _       _     _   _    __  __
@@ -36,7 +26,8 @@ HELP = """commands
   /think         toggle reasoning (deeper answers, much slower)
   /tokens N      set max tokens per reply
   /clear         forget the conversation, start fresh
-  /model         load a different model
+  /model         load a different model / backend (Ollama, LM Studio, …)
+  /agent         switch this local model into the full agent (tools + MCP)
   /fast          GLM-5.2 only — 4-bit skeleton, reloads (~1.2× faster)
   /help          show this
   /exit          quit
@@ -166,9 +157,10 @@ def pick_model(state) -> str | None:
 
 def build_model(model_dir, max_layers, verbose, expert_cache_gb, pin_attn_layers, wired_gb,
                 skeleton_bits, prefetch=False, force_stream=False):
+    from mlx_lm.models.glm_moe_dsa import ModelArgs
+    from .model import StreamingGLM, _total_ram_gb
     cfg = json.load(open(Path(model_dir) / "config.json"))
     mtype = cfg.get("model_type")
-    from .model import _total_ram_gb
     size_gb = sum(p.stat().st_size for p in Path(model_dir).glob("*.safetensors")) / 1e9
     fits = size_gb < 0.65 * _total_ram_gb()  # leave room for KV cache, activations, OS
 
@@ -193,6 +185,7 @@ def build_model(model_dir, max_layers, verbose, expert_cache_gb, pin_attn_layers
 
 
 def load_tokenizer(model_dir):
+    from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
 
@@ -218,7 +211,7 @@ def _encode(tok, messages, think):
     return ids
 
 
-def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_limit=8192):
+def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_limit=8192, on_token=None):
     # `messages` is the whole conversation. Drop oldest turns if prompt + reply budget
     # would overflow the context window, so multi-turn memory stays within bounds.
     msgs = list(messages)
@@ -249,12 +242,14 @@ def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_li
 
     streaming = getattr(model, "streaming", True)
     label = "reasoning — long" if think else "direct"
-    print(_dim(f"\n{'streaming from disk · ' if streaming else 'resident · '}{label}\n"))
+    if verbose:
+        print(_dim(f"\n{'streaming from disk · ' if streaming else 'resident · '}{label}\n"))
     sl.start()
     sl.update("thinking…")
     t0 = time.time()
     n = 0
     gen_ids = []
+    import mlx.core as mx
     try:
         state["win"] = deque(maxlen=10)
         logits = model(mx.array([ids]), cache, on_layer=on_layer)
@@ -263,7 +258,11 @@ def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_li
             nxt = int(mx.argmax(logits[0, -1]))
             if nxt in eos:
                 break
-            sl.emit(tok.decode([nxt]))
+            piece = tok.decode([nxt])
+            if on_token:
+                on_token(piece)
+            else:
+                sl.emit(piece)
             gen_ids.append(nxt)
             n += 1
             state["tok"] = n
@@ -280,7 +279,7 @@ def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_li
         rate = n / max(dt, 1e-9)
         speed = f"{rate:.2f} tok/s" if rate >= 0.01 else f"{dt/max(n,1):.0f}s/token"  # s/tok for slow streamed runs
         print(_dim(f"\n\n  {n} tokens · {dt:.0f}s · {speed}{extra}"))
-    else:
+    elif not on_token:
         print()
     return tok.decode(gen_ids).strip()
 
@@ -288,28 +287,34 @@ def generate(model, tok, eos, messages, max_tokens, verbose, think=False, ctx_li
 # ---------------------------------------------------------------- session
 
 class Session:
-    def __init__(self, args, state):
-        self.args = args
+    def __init__(self, state):
         self.state = state
-        # _pref is the persisted source of truth (only changed by explicit REPL/menu
-        # actions). think/max_tokens are the EFFECTIVE values for this run: a --flag
-        # is a per-run override that must never be written back to the saved prefs.
-        self._pref = {"think": bool(state["prefs"].get("think", False)),
-                      "max_tokens": int(state["prefs"].get("max_tokens", 512))}
-        self.think = self._pref["think"] or args.think
-        self.max_tokens = args.max_tokens or self._pref["max_tokens"]
-        self.fast = bool(args.fast)
+        prefs = state.get("prefs") or {}
+        self._pref = {"think": bool(prefs.get("think", False)),
+                      "max_tokens": int(prefs.get("max_tokens", 512)),
+                      "fast": bool(prefs.get("fast", False)),
+                      "stream": bool(prefs.get("stream", False))}
+        self.think = self._pref["think"]
+        self.max_tokens = self._pref["max_tokens"]
+        self.fast = self._pref["fast"]
+        self.force_stream = self._pref["stream"]
         self.model = self.tok = self.eos = None
         self.model_dir = self.name = self.arch = None
-        self.history = []  # running conversation: [{role, content}, ...]
+        self.history = []
+        self._pending_source = None
 
     def load(self, model_dir, announce=True):
         if announce:
             print(f"\nloading {_bold(nice_name(model_dir))} …")
-        self.model = build_model(model_dir, self.args.max_layers, not self.args.quiet,
-                                 self.args.expert_cache_gb, self.args.pin_attn_layers, self.args.wired_gb,
-                                 skeleton_bits=(4 if self.fast else None), prefetch=self.args.prefetch,
-                                 force_stream=self.args.stream)
+        self.model = build_model(
+            model_dir, None, True,
+            float(self.state["prefs"].get("expert_cache_gb") or 0),
+            int(self.state["prefs"].get("pin_attn_layers") or 0),
+            self.state["prefs"].get("wired_gb"),
+            skeleton_bits=(4 if self.fast else None),
+            prefetch=bool(self.state["prefs"].get("prefetch")),
+            force_stream=self.force_stream,
+        )
         self.tok = load_tokenizer(model_dir)
         eos = json.load(open(Path(model_dir) / "config.json")).get("eos_token_id", [])
         self.eos = set(eos if isinstance(eos, list) else [eos])
@@ -318,6 +323,7 @@ class Session:
         self.arch = model_arch(model_dir)
         self.history = []  # fresh conversation per loaded model
         add_recent(self.state, model_dir)
+        add_recent_source(self.state, "mlx", model_dir, self.name)
         self.persist()
 
     @property
@@ -334,8 +340,7 @@ class Session:
         return self.arch == "glm_moe_dsa"
 
     def persist(self):
-        # write only the saved prefs (_pref), never a transient --flag override
-        self.state["prefs"] = dict(self._pref)
+        self.state["prefs"] = {**self.state.get("prefs", {}), **self._pref}
         save_state(self.state)
 
 
@@ -376,11 +381,16 @@ def toggle_fast(sess):
 
 
 def switch_model(sess) -> bool:
-    md = pick_model(sess.state)
-    if md is None:
+    from .agent.discover import pick_source
+    src = pick_source(sess.state, is_model_dir, lambda: pick_model(sess.state))
+    if src is None:
         return False
-    sess.fast = False  # reset per-model runtime option
-    sess.load(md)
+    if src.get("kind") != "mlx":
+        sess._pending_source = src
+        return True
+    sess.fast = False
+    sess._pending_source = None
+    sess.load(src["path"])
     print(_dim(f"  loaded {sess.name} · {sess.mode}"))
     return True
 
@@ -392,8 +402,9 @@ def settings_menu(sess) -> str:
         print(f"   1  Reasoning      {_bold('on' if sess.think else 'off')}   {_dim('deeper, much slower')}")
         print(f"   2  Reply length   {_bold(str(sess.max_tokens))} {_dim('tokens')}")
         print(f"   3  Switch model   {_dim(sess.name)}")
+        print(f"   4  Force stream   {_bold('on' if sess.force_stream else 'off')}   {_dim('even if it fits in RAM')}")
         if sess.is_glm:
-            print(f"   4  Fast mode      {_bold('on' if sess.fast else 'off')}   {_dim('4-bit skeleton, reloads')}")
+            print(f"   5  Fast mode      {_bold('on' if sess.fast else 'off')}   {_dim('4-bit skeleton, reloads')}")
         print(f"   q  Quit LightLX")
         try:
             c = input("  " + _bold("›") + " ").strip().lower()
@@ -408,8 +419,12 @@ def settings_menu(sess) -> str:
             set_tokens(sess)
         elif c == "3":
             if switch_model(sess):
-                return ""
-        elif c == "4" and sess.is_glm:
+                return "switch" if getattr(sess, "_pending_source", None) else ""
+        elif c == "4":
+            sess.force_stream = sess._pref["stream"] = not sess.force_stream
+            sess.persist()
+            print(_dim("  will apply on next load — /model to reload"))
+        elif c == "5" and sess.is_glm:
             toggle_fast(sess)
         elif c in ("q", "quit"):
             return "quit"
@@ -430,8 +445,11 @@ def repl(sess):
         if line in ("/exit", "/quit", "exit", "quit", "/q"):
             return
         if line in ("/menu", "/", "/settings"):
-            if settings_menu(sess) == "quit":
+            action = settings_menu(sess)
+            if action == "quit":
                 return
+            if action == "switch" and getattr(sess, "_pending_source", None):
+                return "switch"
             continue
         if line == "/help":
             print(HELP)
@@ -449,8 +467,11 @@ def repl(sess):
             toggle_fast(sess)
             continue
         if line == "/model" or line == "/switch":
-            switch_model(sess)
+            if switch_model(sess) and getattr(sess, "_pending_source", None):
+                return "switch"
             continue
+        if line == "/agent":
+            return "agent"
         if line.startswith("/tokens"):
             parts = line.split()
             set_tokens(sess, parts[1] if len(parts) == 2 else None)
@@ -460,7 +481,7 @@ def repl(sess):
             continue
         sess.history.append({"role": "user", "content": line})
         reply = generate(sess.model, sess.tok, sess.eos, sess.history, sess.max_tokens,
-                         verbose=not sess.args.quiet, think=sess.think, ctx_limit=sess.ctx_limit)
+                         verbose=True, think=sess.think, ctx_limit=sess.ctx_limit)
         if reply:
             sess.history.append({"role": "assistant", "content": reply})
         else:
@@ -469,45 +490,195 @@ def repl(sess):
 
 # ---------------------------------------------------------------- entrypoint
 
+def _remember(state, source):
+    if source["kind"] == "mlx":
+        add_recent_source(state, "mlx", source["path"], nice_name(source["path"]))
+    else:
+        add_recent_source(state, source["kind"], source["model"], source["model"], url=source.get("url"))
+        if source.get("url") and source["kind"] in ("ollama", "lmstudio"):
+            state["prefs"][f"{source['kind']}_url"] = source["url"]
+        if source["kind"] == "lmstudio" and source.get("api_key"):
+            state["prefs"]["lmstudio_api_key"] = source["api_key"]
+    save_state(state)
+
+
+def _ask_choice(title, options, allow_back=True):
+    print("\n  " + _bold(title) + (_dim("   number · Enter to back") if allow_back else ""))
+    for i, (label, hint) in enumerate(options, 1):
+        extra = f"   {_dim(hint)}" if hint else ""
+        print(f"   {i}  {label}{extra}")
+    while True:
+        try:
+            raw = input("  " + _bold("›") + " ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if allow_back and raw in ("", "b", "back", "q"):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print(_dim("  pick a number"))
+
+
+def _workspace_for(state, carry):
+    if carry is not None:
+        if isinstance(carry, dict) and carry.get("workspace") and os.path.isdir(carry["workspace"]):
+            return carry["workspace"]
+        ws = getattr(getattr(carry, "ws", None), "root", None)
+        if ws and os.path.isdir(str(ws)):
+            return str(ws)
+        saved = state["prefs"].get("workspace")
+        if saved and os.path.isdir(saved):
+            return saved
+        return os.getcwd()
+    return _ask_workspace(state, carry)
+
+
+def _ask_workspace(state, carry=None):
+    cwd = os.getcwd()
+    saved = state["prefs"].get("workspace") or ""
+    carried = ""
+    if isinstance(carry, dict):
+        carried = carry.get("workspace") or ""
+    elif carry is not None:
+        ws = getattr(getattr(carry, "ws", None), "root", None)
+        carried = str(ws) if ws else ""
+    choices = []
+    paths = []
+    for p, label in ((cwd, "this folder"), (saved, "last used"), (carried, "from session")):
+        p = os.path.abspath(os.path.expanduser(p)) if p else ""
+        if not p or not os.path.isdir(p) or p in paths:
+            continue
+        choices.append((p, label))
+        paths.append(p)
+    choices.append(("other", "type a path"))
+    pick = _ask_choice("Workspace", [(c[0] if c[0] != "other" else "somewhere else", c[1]) for c in choices], allow_back=False)
+    if pick is None:
+        return cwd
+    chosen = choices[pick][0]
+    if chosen != "other":
+        state["prefs"]["workspace"] = chosen
+        return chosen
+    try:
+        raw = input(_dim("  folder › ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        return cwd
+    path = os.path.abspath(os.path.expanduser(clean_path(raw) if raw else cwd))
+    if not os.path.isdir(path):
+        print(_dim(f"  not a directory — using {cwd}"))
+        return cwd
+    state["prefs"]["workspace"] = path
+    return path
+
+
+def _ask_mlx_mode(carry):
+    if carry:
+        return "agent"
+    pick = _ask_choice("Use this model as", [
+        ("Chat", "just talk"),
+        ("Agent", "files, tools, MCP, subagents"),
+    ], allow_back=False)
+    return "agent" if pick == 1 else "chat"
+
+
+def _run_agent(provider, state, native_tools=True, carry=None, source=None, workspace=None):
+    from .agent.repl import AgentSession, agent_repl, apply_record
+    ws = workspace or state["prefs"].get("workspace") or os.getcwd()
+    sess = AgentSession(provider, ws, state["prefs"], native_tools=native_tools, source=source)
+    old_label = None
+    if isinstance(carry, dict) and carry.get("history") is not None:
+        apply_record(sess, carry)
+        old_label = carry.get("provider")
+    elif carry is not None and getattr(carry, "history", None) is not None:
+        sess.history = list(carry.history)
+        sess.session_id = getattr(carry, "session_id", None)
+        old = getattr(carry, "provider", None)
+        old_label = getattr(old, "label", None) or getattr(carry, "label", None)
+    if old_label and old_label != provider.label and sess.history:
+        did = sess.apply_handoff(old_label)
+        print(_dim(f"  handed off {old_label} → {provider.label} · ctx {sess.context_length}"
+                   + (" · compacted" if did else "")))
+    try:
+        return agent_repl(sess), sess
+    finally:
+        sess.persist()
+        sess.close()
+        save_state(state)
+
+
+def _mlx_provider(sess):
+    from .agent.providers import MlxLocal
+    return MlxLocal(
+        generate, sess.model, sess.tok, sess.eos,
+        think=sess.think, ctx_limit=sess.ctx_limit, name=sess.name,
+    )
+
+
 def main():
-    ap = argparse.ArgumentParser(description="LightLX — run any model, big or small, on Apple Silicon")
-    ap.add_argument("--model-dir", default=None, help="skip the picker and load this model")
-    ap.add_argument("--prompt", default=None, help="one-shot: answer this and exit (for scripts)")
-    ap.add_argument("--max-tokens", type=int, default=None)
-    ap.add_argument("--think", action="store_true")
-    ap.add_argument("--fast", action="store_true")
-    ap.add_argument("--stream", action="store_true", help="force streaming even if the model fits in RAM")
-    ap.add_argument("--max-layers", type=int, default=None, help="debug: run only the first N layers")
-    ap.add_argument("--expert-cache-gb", type=float, default=0.0)
-    ap.add_argument("--pin-attn-layers", type=int, default=0)
-    ap.add_argument("--wired-gb", type=float, default=None)
-    ap.add_argument("--prefetch", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
+    if len(sys.argv) > 1:
+        print(_dim("lightlx is menu-driven — extra arguments are ignored. just run:  lightlx"))
 
     print(BANNER)
     state = load_state()
-    sess = Session(a, state)
-
-    model_dir = clean_path(a.model_dir) if a.model_dir else None
-    if a.model_dir and not is_model_dir(model_dir):
-        print(f"✗ not a model folder: {model_dir}")
-        model_dir = None
-    if model_dir is None:
-        model_dir = pick_model(state)
-        if model_dir is None:
-            print("bye.")
-            return
-    sess.load(model_dir)
-
-    if a.prompt:  # one-shot for scripting
-        print("\n" + _bold("›") + f" {a.prompt}")
-        generate(sess.model, sess.tok, sess.eos, [{"role": "user", "content": a.prompt}],
-                 sess.max_tokens, verbose=not a.quiet, think=sess.think, ctx_limit=sess.ctx_limit)
+    carry = None
+    from .agent.discover import pick_source
+    source = pick_source(state, is_model_dir, lambda: pick_model(state))
+    if source is None:
+        print("bye.")
         return
 
-    repl(sess)
-    sess.persist()
+    while source:
+        if source.get("kind") == "resume":
+            rec = source.get("record") or {}
+            carry = rec
+            source = rec.get("source") or None
+            if source is None:
+                print(_dim("  session has no backend — pick one"))
+                source = pick_source(state, is_model_dir, lambda: pick_model(state))
+                continue
+        _remember(state, source)
+        if source["kind"] != "mlx":
+            from .agent.discover import build_provider
+            try:
+                provider = build_provider(source)
+            except Exception as e:
+                print(_dim(f"  {e}"))
+                return
+            ws = _workspace_for(state, carry)
+            action, agent_sess = _run_agent(
+                provider, state, native_tools=True, carry=carry, source=source, workspace=ws,
+            )
+            if action == "switch":
+                carry = agent_sess
+                source = pick_source(state, is_model_dir, lambda: pick_model(state))
+                continue
+            break
+
+        sess = Session(state)
+        sess.load(source["path"])
+        mode = _ask_mlx_mode(carry)
+        if mode == "agent":
+            ws = _workspace_for(state, carry)
+            action, agent_sess = _run_agent(
+                _mlx_provider(sess), state, native_tools=False, carry=carry, source=source, workspace=ws,
+            )
+        else:
+            action, agent_sess = repl(sess), None
+        sess.persist()
+        if action == "agent":
+            ws = _workspace_for(state, carry)
+            action, agent_sess = _run_agent(
+                _mlx_provider(sess), state, native_tools=False,
+                carry=agent_sess or carry, source=source, workspace=ws,
+            )
+        if action == "switch":
+            carry = agent_sess
+            source = getattr(sess, "_pending_source", None)
+            if source is None:
+                source = pick_source(state, is_model_dir, lambda: pick_model(state))
+            continue
+        break
+
+    save_state(state)
     print(_dim("\nsaved. see you next time."))
 
 

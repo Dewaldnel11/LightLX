@@ -21,7 +21,7 @@ at a model directory and go.
 Three modes, auto-selected by size then architecture:
 - **Resident (fast)** — if the model **fits in RAM**, it's loaded fully onto the GPU
   and runs at full speed, exactly like **LM Studio / Ollama**. No streaming. (Force
-  streaming instead with `--stream`.)
+  streaming instead from `/menu` → Force stream.)
 - **Generic streaming** — any mlx-lm-supported model **too big for RAM**, now **dense
   *and* MoE**. Dense (Llama, Qwen, Mistral, Gemma, Phi) streams layer-by-layer; MoE
   (Mixtral, Qwen2/3-MoE, OLMoE, DeepSeek, …) streams only the routed **top-k experts
@@ -114,26 +114,132 @@ resident  Qwen2.5-0.5B-Instruct ›  hello
 - **It remembers across sessions.** Recent models + your preferences (reasoning,
   reply length) are saved to `~/.lightlx/state.json` on exit and restored next time.
 
-Flags still exist for scripting (`--model-dir`, `--prompt`, `--stream`, `--quiet`,
-…) but you never need them.
+There are **no flags**. Everything is a numbered menu or a question.
 
-### `--fast` / `/fast` — 4-bit skeleton, no download
+---
 
-Quantizes the skeleton (attention/shared/dense/head) to 4-bit **on load, from
-your own BF16 weights** (not a download), and keeps it resident; the **routed
-experts stay full BF16**. Measured **~1.2×** on the M4 Pro (the skeleton stops
-streaming). It's the one software win that helps — modestly. (GLM-5.2 only.)
+## Ollama, LM Studio, and the agent
+
+`lightlx` can talk to **any local OpenAI-compatible server** — Ollama, LM Studio,
+vLLM, llama.cpp — and run a full coding agent: files, shell, MCP, GitHub docs,
+and **parallel subagents** for long-horizon work.
+
+```
+$ lightlx
+
+Resume
+  1  refactor cli.py           ollama/qwen · 2h ago
+
+Recent
+  2  qwen2.5-coder:32b         ollama
+
+Connect
+  3  Local MLX folder          stream or resident
+  4  Ollama                    running · 6 models
+  5  LM Studio                 running · 2 models
+  6  Custom OpenAI URL         vLLM, llama.cpp, …
+```
+
+Pick a number. Local MLX then asks **Chat** or **Agent**. Ollama / LM Studio
+go straight to the agent (and ask which folder is the workspace). If a server
+isn't running, you get options: try another address, type a model name, or go back.
+
+On a local MLX chat session, `/agent` switches into the full agent.
+
+### What the agent can do
+
+| Tool | Role |
+|---|---|
+| `read_file` / `write_file` / `edit_file` | Read, create, and patch files |
+| `list_dir` / `glob` / `grep` | Navigate the workspace |
+| `bash` | Run shell commands in the workspace |
+| `fetch_url` | Pull a web page (HTML stripped to text) |
+| `docs` | Read Claude Code, Codex, Ollama, MCP, or any `owner/repo` from GitHub |
+| `skill` | Load a SKILL.md (Claude / Codex / LightLX skills) |
+| `memory` | Read/write auto-memory that survives sessions |
+| `task` | Spawn a **subagent** (`explore` / `implement` / `general`) |
+| MCP tools | Anything you attach in `~/.lightlx/mcp.json` |
+
+Several `task` calls in one turn run **in parallel** (Ollama / LM Studio). Use
+`explore` for read-only research, `implement` to land a change, `general` for
+everything else. Subagents cannot nest.
+
+```
+  → task  map the auth flow
+  → task  find flaky tests
+    ▸ subagent explore · map the auth flow
+      → grep  login
+      ✓ grep  login
+    ✓ subagent explore · map the auth flow
+```
+
+Docs aliases: `claude-code`, `codex`, `ollama`, `lmstudio`, `mcp`, `lightlx` —
+or pass any `owner/repo`. Example: *“read the Codex AGENTS.md and match that
+style here.”*
+
+### MCP
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "…" }
+    }
+  }
+}
+```
+
+Put that at `~/.lightlx/mcp.json`, or `.lightlx/mcp.json` / `mcp.json` in the
+workspace. `/mcp` shows what's connected; settings → Reload MCP picks up edits.
+Each MCP tool is registered as `mcp_<server>_<tool>`.
+
+Context is **auto-detected** from Ollama (`/api/show`, loaded `num_ctx`) and LM
+Studio (`loaded_context_length`). The prompt line shows `used/window`. When the
+session nears ~72% of the window, LightLX **compacts** older turns into a
+handoff summary (or `/compact` anytime).
+
+Sessions auto-save to `~/.lightlx/sessions/`. Resume from the startup list or `/resume`.
+
+`/handoff` (or `/model`) switches Ollama ↔ LM Studio ↔ local MLX **without
+dropping the chat**. If the new window is smaller, it compacts first.
+
+### Instructions, skills, and memory
+
+Same shape as Claude Code and Codex:
+
+| What | Where | When it loads |
+|---|---|---|
+| Project instructions | `LIGHTLX.md`, `AGENTS.md`, `CLAUDE.md`, `.lightlx/LIGHTLX.md` | Every session |
+| Personal / local | `LIGHTLX.local.md`, `~/.lightlx/LIGHTLX.md` | Every session |
+| Rules | `.lightlx/rules/*.md`, `.claude/rules/*.md` | Every session (`paths:` frontmatter = on demand later) |
+| Skills | `.lightlx/skills/<name>/SKILL.md`, `~/.lightlx/skills/`, plus `.claude/skills` and `.codex/skills` | Catalog always; body via `skill` or `/name` |
+| Auto memory | `~/.lightlx/memory/<project>/MEMORY.md` | Index every session; topic files on demand |
+
+`@path` imports work inside instruction files (like Claude). Skills follow the Agent Skills `SKILL.md` layout, including `!`command`` injection.
+
+Claude and Codex skills are used as-is: LightLX reads `~/.claude/skills`, `~/.codex/skills`, and this repo’s `.claude/` / `.codex/` folders. `/import` copies or symlinks them into `~/.lightlx/skills` (or `.lightlx/skills`). A skill with `context: fork` runs as a **subagent** (same as `task`); several can run in parallel.
+
+`/init` writes a starter `LIGHTLX.md`. `/skills` lists skills. `/memory` shows what the agent has saved. Say “remember we use pnpm” and it writes the memory store.
+
+Bundled: `/code-review`, `/summarize-changes`.
+
+Agent slash commands: `/tools` `/skills` `/memory` `/init` `/mcp` `/docs` `/workspace` `/task` `/compact` `/resume` `/save` `/handoff` `/clear` `/menu`.
+
+### Fast mode — 4-bit skeleton, no download
+
+`/menu` → Fast mode (or `/fast`). Quantizes the skeleton (attention/shared/dense/head)
+to 4-bit **on load, from your own BF16 weights** (not a download), and keeps it
+resident; the **routed experts stay full BF16**. Measured **~1.2×** on the M4 Pro.
+GLM-5.2 only. Force-streaming (even when a model fits in RAM) is also in `/menu`.
 
 ## Run any model
 
-Point LightLX at any mlx-lm-supported model directory. It checks the size: if it
+Point LightLX at any mlx-lm-supported model directory — pick **Local MLX folder**
+and drag/paste the path, or choose a remembered one. It checks the size: if it
 **fits in RAM** it loads fully resident (fast, like LM Studio/Ollama); if it's
-**too big** it streams from disk. Either way, one command:
-
-```bash
-lightlx --model-dir /path/to/any-hf-model --prompt "Hello"
-lightlx --model-dir ... --stream            # force streaming even if it fits
-```
+**too big** it streams from disk.
 
 (Downloaded models can live anywhere; the repo keeps a `models/` folder for
 convenience.)
@@ -169,7 +275,7 @@ real model:
 | Async prefetch | **0.99× (no help)** | prefill is ~73% disk-*idle* — not I/O-bound to begin with |
 | Gather/scatter MoE | **0.76× (slower)** | overhead-bound; for real prompts ~all 256 experts activate anyway |
 | Read/compute overlap | **0.86× (slower)** | decode compute is µs/layer — nothing to hide the per-layer read behind; the read *is* the critical path |
-| `--fast` (4-bit skeleton) | **~1.2×** | the only win — skeleton stops streaming |
+| Fast mode (4-bit skeleton) | **~1.2×** | the only win — skeleton stops streaming |
 
 **Conclusion:** no software trick is a big win on 24 GB + a 1 GB/s drive. The cost
 is `(per-expert overhead + bytes) × (experts touched)`, and for any non-trivial
@@ -192,6 +298,7 @@ layer** — there's no small per-prompt subset to exploit. Real speed comes from
 - ✅ **Resident mode**: models that fit in RAM load fully on the GPU and run fast (like LM Studio/Ollama) — auto-selected; ~80 tok/s on Qwen2.5-0.5B.
 - ✅ **Generic engine — dense**: streams any mlx-lm dense model (Llama/Qwen/Mistral/Gemma/Phi/…) too big for RAM — verified **bit-identical** to native mlx-lm on Qwen2.
 - ✅ **Generic engine — MoE scalpel**: streams uniform-MoE models (Mixtral/Qwen2-3-MoE/OLMoE/DeepSeek/…) loading only the routed top-k experts/token — verified **bit-identical** (Δ=0) to native mlx-lm on OLMoE → coherent text.
+- ✅ **Ollama / LM Studio / OpenAI-compat**: full local agent — files, shell, MCP, GitHub docs, parallel subagents.
 - ✅ **Conversation memory**: multi-turn history with context auto-trim, `/clear`, partial-reply capture on Ctrl-C — works in resident and streaming.
 - ✅ Runs full unquantized GLM-5.2 on a 24 GB Mac (streaming, MoE-native).
 - ✅ Streaming verified vs real shards; forward verified (finite logits, prefill
@@ -209,8 +316,7 @@ layer** — there's no small per-prompt subset to exploit. Real speed comes from
 
 ## Roadmap
 
-- **Two-tier CLI** — small resident model (e.g. GLM-4.7-Flash 4-bit, ~16 GB)
-  answers instantly; full GLM-5.2 on `/big`. The day-to-day usability win.
+- **Two-tier CLI** — small resident / Ollama model answers instantly; full GLM-5.2 on `/big`. The day-to-day usability win.
 - **Long context** — implement the DSA lightning indexer + shared-indexer wiring
   for > 2048 tokens (MLA already keeps the KV cache tiny).
 - **Faster tier** — TB5 NVMe support; optional local 4-bit-expert quantizer.

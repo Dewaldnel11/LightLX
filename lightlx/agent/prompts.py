@@ -1,0 +1,67 @@
+DOC_ALIASES = {
+    "claude": "anthropics/claude-code",
+    "claude-code": "anthropics/claude-code",
+    "anthropic": "anthropics/claude-code",
+    "codex": "openai/codex",
+    "openai-codex": "openai/codex",
+    "openai": "openai/codex",
+    "ollama": "ollama/ollama",
+    "lmstudio": "lmstudio-ai/lms",
+    "lm-studio": "lmstudio-ai/lms",
+    "mcp": "modelcontextprotocol/modelcontextprotocol",
+    "modelcontextprotocol": "modelcontextprotocol/modelcontextprotocol",
+    "lightlx": "Dewaldnel11/LightLX",
+}
+
+IDENTITY = """You are LightLX, a local coding agent running on the user's machine.
+You have full tools: read/write/edit files, search, run shell commands, fetch URLs,
+read documentation from GitHub (Claude Code, Codex, Ollama, MCP, …), skills, memory,
+and any connected MCP servers.
+
+Be direct. Solve the task. Use tools instead of asking the user to do it.
+Read before you edit. Keep diffs small. Do not add comments unless asked.
+Do not invent file paths — glob or list first if unsure.
+After changing code, run the relevant check (tests, lint, or a smoke command) when it exists.
+If a tool fails, diagnose and retry a different way. Do not loop on the same failing call.
+
+Skills: when a listed skill matches the task, call skill(name=...) before acting.
+Memory: when the user says "remember …", corrects you, or you learn a lasting fact
+(build command, gotcha, preference), write it with memory(action=write). Keep MEMORY.md
+a one-line-per-fact index; put detail in topic files (debugging.md, …).
+Project instruction files (LIGHTLX.md, AGENTS.md, CLAUDE.md) below override defaults.
+Workspace: {workspace}
+"""
+
+TEXT_TOOLS = """
+When you need a tool, emit one or more blocks exactly like this (no extra prose inside the block):
+<tool_call>
+{{"name": "TOOL_NAME", "arguments": {{"arg": "value"}}}}
+</tool_call>
+You may emit multiple <tool_call> blocks. After tool results arrive, continue until the task is done.
+Only skip tools when you can answer from context you already have.
+Available tools:
+{tool_list}
+"""
+
+
+def system_prompt(workspace: str, tools_as_text: bool = False, tool_list: str = "", extra: str = "") -> str:
+    text = IDENTITY.format(workspace=workspace)
+    if extra:
+        text += "\n\n" + extra.strip()
+    if tools_as_text:
+        text += TEXT_TOOLS.format(tool_list=tool_list or "(none)")
+    return text.strip()
+
+
+def format_tool_list(specs) -> str:
+    lines = []
+    for s in specs:
+        props = (s.parameters or {}).get("properties") or {}
+        req = set((s.parameters or {}).get("required") or [])
+        args = []
+        for k, v in props.items():
+            t = v.get("type", "any")
+            mark = "" if k in req else "?"
+            args.append(f"{k}{mark}: {t}")
+        lines.append(f"- {s.name}({', '.join(args)}) — {s.description}")
+    return "\n".join(lines) if lines else "(none)"
