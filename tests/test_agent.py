@@ -177,6 +177,27 @@ class ContextTests(unittest.TestCase):
         self.assertIn("Continue", out[-1]["content"])
 
 
+class ResumeTests(unittest.TestCase):
+    def test_hydrate_and_unanswered(self):
+        from lightlx.agent.loop import unanswered_tool_calls
+        from lightlx.agent.sessions import hydrate_messages
+        from lightlx.agent.types import ToolCall
+        raw = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "name": "read_file", "arguments": {"path": "a.py"}},
+                {"id": "c2", "name": "read_file", "arguments": {"path": "b.py"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "ok"},
+        ]
+        msgs = hydrate_messages(raw)
+        self.assertIsInstance(msgs[1]["tool_calls"][0], ToolCall)
+        left = unanswered_tool_calls(msgs)
+        self.assertEqual(len(left), 1)
+        self.assertEqual(left[0].name, "read_file")
+        self.assertEqual(left[0].arguments["path"], "b.py")
+
+
 class SessionStoreTests(unittest.TestCase):
     def test_save_load(self):
         from lightlx.agent import sessions

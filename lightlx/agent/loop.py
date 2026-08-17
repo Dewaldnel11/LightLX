@@ -1,3 +1,4 @@
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -51,6 +52,24 @@ def _run_one(spec, args):
         return f"error: {e}\n{traceback.format_exc()[-800:]}"
 
 
+def unanswered_tool_calls(messages):
+    last_i = -1
+    last = None
+    for i, m in enumerate(messages or []):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            last_i, last = i, m
+    if last is None:
+        return []
+    have = {m.get("tool_call_id") for m in messages[last_i + 1:] if m.get("role") == "tool"}
+    out = []
+    for tc in last["tool_calls"]:
+        if not isinstance(tc, ToolCall):
+            continue
+        if tc.id not in have:
+            out.append(tc)
+    return out
+
+
 def execute_tools(calls, registry, on_event=None, depth=0, parallel=True):
     results = [None] * len(calls)
 
@@ -68,16 +87,21 @@ def execute_tools(calls, registry, on_event=None, depth=0, parallel=True):
             on_event("tool_end", name=call.name, detail=label, ok=ok, depth=depth)
         return i, out
 
-    if parallel and len(calls) > 1:
-        with ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
-            futs = [pool.submit(work, i, c) for i, c in enumerate(calls)]
-            for fut in as_completed(futs):
-                i, out = fut.result()
+    try:
+        if parallel and len(calls) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(calls))) as pool:
+                futs = [pool.submit(work, i, c) for i, c in enumerate(calls)]
+                for fut in as_completed(futs):
+                    i, out = fut.result()
+                    results[i] = out
+        else:
+            for i, c in enumerate(calls):
+                _, out = work(i, c)
                 results[i] = out
-    else:
-        for i, c in enumerate(calls):
-            _, out = work(i, c)
-            results[i] = out
+    except KeyboardInterrupt:
+        for i, r in enumerate(results):
+            if r is None:
+                results[i] = "error: interrupted"
     return results
 
 
@@ -93,6 +117,8 @@ def run_agent(
     depth=0,
     native_tools=True,
     context_length=None,
+    deadline=None,
+    on_checkpoint=None,
 ):
     tools = [s.openai_tool() for s in registry.values()] if native_tools else None
     last = ""
@@ -100,24 +126,41 @@ def run_agent(
     nudged = False
     narrate_nudge = False
     ctx = context_length or getattr(provider, "context_length", None)
+
+    def checkpoint():
+        if on_checkpoint and depth == 0:
+            on_checkpoint(messages)
+
+    leftover = unanswered_tool_calls(messages)
+    if leftover:
+        outs = execute_tools(
+            leftover, registry, on_event=on_event, depth=depth,
+            parallel=getattr(provider, "parallel_safe", True),
+        )
+        for call, out in zip(leftover, outs):
+            messages.append(_tool_message(call, out))
+        checkpoint()
+
     for _ in range(max_iters):
         steps += 1
+        if deadline and time.time() > deadline:
+            if on_event:
+                on_event("error", text="timed out", depth=depth)
+            return AgentResult(last or "(timed out)", messages, steps)
         if ctx and depth == 0:
             messages, did = maybe_compact(provider, messages, ctx, max_tokens, on_event=on_event)
+            if did:
+                checkpoint()
             if did and on_event:
                 on_event("compact_done", depth=depth)
         if on_event:
             on_event("model_start", depth=depth)
 
-        def on_text(t, _d=depth):
-            if on_event:
-                on_event("text", text=t, depth=_d)
-
         try:
             payload = to_openai_messages(messages) if native_tools else messages
             comp = provider.complete(
                 payload, tools=tools, max_tokens=max_tokens,
-                temperature=temperature, on_text=on_text,
+                temperature=temperature, on_text=None,
             )
         except Exception as e:
             if on_event:
@@ -132,6 +175,11 @@ def run_agent(
 
         messages.append(_assistant_message(comp))
         last = (comp.content or "").strip()
+        if comp.tool_calls:
+            last = ""
+            checkpoint()
+        elif last and on_event:
+            on_event("text", text=last, depth=depth)
         if not comp.tool_calls:
             used_tools = any(m.get("role") == "tool" for m in messages)
             if looks_like_tool_narration(last) and not narrate_nudge:
@@ -157,15 +205,15 @@ def run_agent(
                 on_event("turn_end", depth=depth)
             return AgentResult(last, messages, steps)
 
-        if on_event and last:
-            on_event("text", text="\n", depth=depth)
-
         outs = execute_tools(
             comp.tool_calls, registry, on_event=on_event, depth=depth,
             parallel=getattr(provider, "parallel_safe", True),
         )
         for call, out in zip(comp.tool_calls, outs):
             messages.append(_tool_message(call, out))
+        checkpoint()
+        if any(str(o).startswith("error: interrupted") for o in outs):
+            raise KeyboardInterrupt
 
     if on_event:
         on_event("error", text=f"stopped after {max_iters} steps", depth=depth)
@@ -213,9 +261,10 @@ class SubagentLauncher:
         try:
             result = run_agent(
                 self.provider, messages, registry,
-                max_tokens=self.max_tokens, max_iters=30,
+                max_tokens=self.max_tokens, max_iters=20,
                 temperature=self.temperature, on_event=self.on_event,
                 depth=1, native_tools=self.native_tools,
+                deadline=time.time() + 180,
             )
         except Exception as e:
             if self.on_event:

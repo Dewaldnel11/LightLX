@@ -15,15 +15,17 @@ def _now():
 
 def _safe(obj):
     if isinstance(obj, dict):
-        return {k: _safe(v) for k, v in obj.items() if k != "tool_calls" or isinstance(v, (list, dict, str, int, float, bool, type(None)))}
+        return {k: _safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        out = []
-        for x in obj:
-            if hasattr(x, "name") and hasattr(x, "arguments"):
-                out.append({"name": x.name, "arguments": x.arguments, "id": getattr(x, "id", "")})
-            else:
-                out.append(_safe(x))
-        return out
+        return [_safe(x) for x in obj]
+    if hasattr(obj, "name") and hasattr(obj, "arguments"):
+        return {
+            "id": getattr(obj, "id", "") or "",
+            "type": "function",
+            "name": obj.name,
+            "arguments": obj.arguments if isinstance(obj.arguments, dict) else {},
+            "raw_arguments": getattr(obj, "raw_arguments", "") or "",
+        }
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
     return str(obj)
@@ -90,6 +92,36 @@ def delete_session(sid: str) -> bool:
         return False
 
 
+def hydrate_messages(messages):
+    from .types import ToolCall
+    from .providers import parse_args
+    out = []
+    for raw in messages or []:
+        m = dict(raw)
+        tcs = m.get("tool_calls")
+        if tcs:
+            calls = []
+            for tc in tcs:
+                if isinstance(tc, ToolCall):
+                    calls.append(tc)
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                args = fn.get("arguments") if isinstance(fn, dict) else tc.get("arguments")
+                raw_a = fn.get("raw_arguments") if isinstance(fn, dict) else tc.get("raw_arguments")
+                if raw_a is None:
+                    raw_a = args if isinstance(args, str) else ""
+                name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
+                calls.append(ToolCall(
+                    id=tc.get("id") or "",
+                    name=name,
+                    arguments=parse_args(args),
+                    raw_arguments=raw_a if isinstance(raw_a, str) else "",
+                ))
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
 def title_from(history) -> str:
     for m in history or []:
         if m.get("role") == "user":
@@ -103,12 +135,15 @@ def title_from(history) -> str:
 def record_from(sess, source=None):
     hist = [m for m in (sess.history or []) if m.get("role") in ("user", "assistant", "system")]
     src = source or getattr(sess, "source", None) or {}
+    pending = getattr(sess, "pending", None)
     return {
         "id": getattr(sess, "session_id", None) or new_id(),
-        "title": title_from(hist),
+        "title": title_from(hist) or title_from(pending),
         "source": src,
         "workspace": str(sess.ws.root),
         "history": hist,
+        "pending": pending or None,
+        "in_progress": bool(pending),
         "provider": getattr(sess.provider, "label", ""),
         "kind": getattr(sess.provider, "kind", ""),
         "context_length": getattr(sess.provider, "context_length", None),

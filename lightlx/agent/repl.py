@@ -8,7 +8,7 @@ from .mcp import MCPHub, load_mcp_config
 from .memory import format_instructions, init_project, load_instructions
 from .memory import MemoryStore
 from .prompts import DOC_ALIASES
-from .sessions import age, list_sessions, load_session, record_from, save_session, title_from
+from .sessions import age, hydrate_messages, list_sessions, load_session, record_from, save_session, title_from
 from .skills import catalog, discover_skills, expand_skill, import_skills, list_importable
 from .tools import BuiltinTools, Workspace
 
@@ -60,6 +60,7 @@ class AgentSession:
         self.native_tools = native_tools
         self.source = source or {}
         self.history = []
+        self.pending = None
         self.session_id = None
         self.hub = MCPHub()
         self.max_tokens = int(prefs.get("agent_max_tokens") or prefs.get("max_tokens") or 4096)
@@ -84,10 +85,14 @@ class AgentSession:
         return "\n\n".join(p for p in parts if p)
 
     def persist(self):
-        if not self.history:
+        if not self.history and not self.pending:
             return
         rec = record_from(self, self.source)
         self.session_id = save_session(rec)
+
+    def checkpoint(self, messages):
+        self.pending = [m for m in (messages or []) if m.get("role") != "system"]
+        self.persist()
 
     def apply_handoff(self, old_label):
         new = getattr(self.provider, "label", "")
@@ -208,6 +213,41 @@ def _bind_events(sess, on_event):
     return make_registry
 
 
+def _finish_turn(sess, result):
+    sess.pending = None
+    if result.text:
+        sess.history.append({"role": "assistant", "content": result.text})
+    else:
+        sess.history.append({"role": "assistant", "content": "(done)"})
+    sess.persist()
+
+
+def resume_pending(sess, on_event):
+    registry = _bind_events(sess, on_event)
+    rest = hydrate_messages(sess.pending)
+    messages = seed_messages(
+        str(sess.ws.root), registry(kind="general", depth=0),
+        rest, tools_as_text=not sess.native_tools,
+        extra=sess.prompt_extra(),
+    )
+    print(_dim("  resuming in-flight turn…"))
+    try:
+        result = run_agent(
+            sess.provider, messages, registry(kind="general", depth=0),
+            max_tokens=sess.max_tokens, temperature=sess.temperature,
+            on_event=on_event, native_tools=sess.native_tools,
+            context_length=sess.context_length,
+            on_checkpoint=sess.checkpoint,
+        )
+    except KeyboardInterrupt:
+        print(_dim("\n— stopped — checkpoint saved. resume next launch."))
+        return
+    except Exception as e:
+        print(_dim(f"\n  {e}"))
+        return
+    _finish_turn(sess, result)
+
+
 def run_turn(sess, user_text, on_event):
     registry = _bind_events(sess, on_event)
     sess.history.append({"role": "user", "content": user_text})
@@ -219,26 +259,25 @@ def run_turn(sess, user_text, on_event):
         sess.history, tools_as_text=not sess.native_tools,
         extra=sess.prompt_extra(),
     )
+    sess.checkpoint(messages)
     try:
         result = run_agent(
             sess.provider, messages, registry(kind="general", depth=0),
             max_tokens=sess.max_tokens, temperature=sess.temperature,
             on_event=on_event, native_tools=sess.native_tools,
             context_length=sess.context_length,
+            on_checkpoint=sess.checkpoint,
         )
     except KeyboardInterrupt:
-        print(_dim("\n— stopped —"))
-        sess.persist()
+        print(_dim("\n— stopped — checkpoint saved. pick Resume next time."))
         return
     except Exception as e:
         print(_dim(f"\n  {e}"))
         sess.history.pop()
+        sess.pending = None
+        sess.persist()
         return
-    if result.text:
-        sess.history.append({"role": "assistant", "content": result.text})
-    else:
-        sess.history.append({"role": "assistant", "content": "(done)"})
-    sess.persist()
+    _finish_turn(sess, result)
 
 
 def _prompt_line(sess):
@@ -329,6 +368,8 @@ def _pick_resume():
     print("\n  " + _bold("Sessions"))
     for i, s in enumerate(rows, 1):
         label = s.get("title") or "untitled"
+        if s.get("in_progress") or s.get("pending"):
+            label = "● " + label
         meta = f"{s.get('provider') or s.get('kind') or '?'} · {age(s.get('updated'))}"
         print(f"   {i}  {label:<40} {_dim(meta)}")
     try:
@@ -387,6 +428,7 @@ def apply_record(sess, rec):
     if not rec:
         return False
     sess.history = list(rec.get("history") or [])
+    sess.pending = rec.get("pending") or None
     sess.session_id = rec.get("id")
     ws = rec.get("workspace")
     if ws and os.path.isdir(ws):
@@ -401,6 +443,8 @@ def agent_repl(sess, switch_cb=None):
     print(_dim(f"  {sess.ws.root}"))
     print(_dim("  /menu · /skills · /memory · /help · /exit"))
     printer = make_printer()
+    if sess.pending:
+        resume_pending(sess, printer)
     while True:
         try:
             line = input(_prompt_line(sess)).strip()
@@ -427,6 +471,7 @@ def agent_repl(sess, switch_cb=None):
         if line in ("/clear", "/reset", "/new"):
             sess.persist()
             sess.history = []
+            sess.pending = None
             sess.session_id = None
             print(_dim("  conversation cleared — new session"))
             continue

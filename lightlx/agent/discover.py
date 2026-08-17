@@ -101,7 +101,11 @@ def pick_source(state, is_model_dir, pick_local):
         for s in sessions:
             items.append(("resume", s))
             title = (s.get("title") or s.get("id") or "session")[:36]
+            mark = "● " if s.get("in_progress") or s.get("pending") else ""
             meta = f"{s.get('provider') or s.get('kind') or '?'} · {age(s.get('updated'))}"
+            if mark:
+                meta = "in progress · " + meta
+            title = mark + title
             print(f"  {len(items)}  {title:<28} {_dim(meta)}")
         print()
     if recents:
