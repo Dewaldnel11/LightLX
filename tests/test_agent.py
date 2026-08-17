@@ -150,6 +150,17 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(parse_args({"a": 1}), {"a": 1})
         self.assertEqual(parse_args(""), {})
 
+    def test_to_openai_normalizes_content(self):
+        from lightlx.agent.providers import to_openai_messages
+        msgs = [
+            {"role": "user", "content": {"text": "hi"}},
+            {"role": "assistant", "content": ["part1", "part2"]},
+            {"role": "tool", "content": {"err": "x"}, "tool_call_id": "c1"},
+        ]
+        out = to_openai_messages(msgs)
+        for m in out:
+            self.assertIsInstance(m.get("content"), (str, type(None)))
+
 
 class ContextTests(unittest.TestCase):
     def test_estimate_and_threshold(self):

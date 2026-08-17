@@ -427,11 +427,11 @@ def _to_ollama_messages(messages):
         if role == "tool":
             out.append({
                 "role": "tool",
-                "content": m.get("content") or "",
+                "content": message_text(m.get("content")),
                 "name": m.get("name") or "",
             })
             continue
-        item = {"role": role, "content": m.get("content") or ""}
+        item = {"role": role, "content": message_text(m.get("content"))}
         if m.get("tool_calls"):
             item["tool_calls"] = []
             for tc in m["tool_calls"]:
@@ -493,7 +493,7 @@ def flatten_for_chat(messages):
                 "content": f"<tool_result name=\"{name}\">\n{m.get('content') or ''}\n</tool_result>",
             })
         elif role == "assistant" and m.get("tool_calls"):
-            content = m.get("content") or ""
+            content = message_text(m.get("content"))
             for tc in m["tool_calls"]:
                 if isinstance(tc, ToolCall):
                     payload = {"name": tc.name, "arguments": tc.arguments}
@@ -503,7 +503,7 @@ def flatten_for_chat(messages):
                 content += "\n<tool_call>\n" + json.dumps(payload) + "\n</tool_call>"
             out.append({"role": "assistant", "content": content})
         else:
-            out.append({"role": role, "content": m.get("content") or ""})
+            out.append({"role": role, "content": message_text(m.get("content"))})
     return out
 
 
@@ -511,7 +511,7 @@ def to_openai_messages(messages):
     out = []
     for m in messages:
         if m.get("role") == "assistant" and m.get("tool_calls"):
-            item = {"role": "assistant", "content": m.get("content") or None, "tool_calls": []}
+            item = {"role": "assistant", "content": message_text(m.get("content")) or None, "tool_calls": []}
             for tc in m["tool_calls"]:
                 if isinstance(tc, ToolCall):
                     item["tool_calls"].append({
@@ -527,8 +527,8 @@ def to_openai_messages(messages):
                 "role": "tool",
                 "tool_call_id": m.get("tool_call_id") or m.get("id") or "",
                 "name": m.get("name") or "",
-                "content": m.get("content") or "",
+                "content": message_text(m.get("content")),
             })
         else:
-            out.append({"role": m.get("role"), "content": m.get("content") or ""})
+            out.append({"role": m.get("role"), "content": message_text(m.get("content"))})
     return out
