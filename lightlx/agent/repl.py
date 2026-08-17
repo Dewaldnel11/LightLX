@@ -64,7 +64,7 @@ class AgentSession:
         self.session_id = None
         self.hub = MCPHub()
         self.max_tokens = int(prefs.get("agent_max_tokens") or prefs.get("max_tokens") or 4096)
-        self.temperature = float(prefs.get("temperature") or 0.2)
+        self.temperature = float(prefs.get("temperature") or 0.1)
         self.context_length = detect_context(provider)
         self.memory = MemoryStore(self.ws.root)
         self.skills = discover_skills(self.ws.root)

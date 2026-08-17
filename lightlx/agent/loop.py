@@ -112,7 +112,7 @@ def run_agent(
     *,
     max_tokens=4096,
     max_iters=MAX_ITERS,
-    temperature=0.2,
+    temperature=0.1,
     on_event=None,
     depth=0,
     native_tools=True,
@@ -126,6 +126,10 @@ def run_agent(
     nudged = False
     narrate_nudge = False
     ctx = context_length or getattr(provider, "context_length", None)
+    read_tools = {"read_file", "list_dir", "glob", "grep", "fetch_url", "docs"}
+    write_tools = {"write_file", "edit_file", "bash"}
+    reads_since_write = 0
+    READ_BUDGET = 6
 
     def checkpoint():
         if on_checkpoint and depth == 0:
@@ -211,9 +215,24 @@ def run_agent(
         )
         for call, out in zip(comp.tool_calls, outs):
             messages.append(_tool_message(call, out))
+            if call.name in write_tools:
+                reads_since_write = 0
+            elif call.name in read_tools:
+                reads_since_write += 1
+        if reads_since_write >= READ_BUDGET:
+            if on_event:
+                on_event("text", text="\n", depth=depth)
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"READ BUDGET EXCEEDED ({reads_since_write} reads, 0 writes). "
+                    "STOP READING. You must now call edit_file or write_file to make changes. "
+                    "No more read tools until you produce edits."
+                ),
+            })
+            reads_since_write = 0
+            continue
         checkpoint()
-        if any(str(o).startswith("error: interrupted") for o in outs):
-            raise KeyboardInterrupt
 
     if on_event:
         on_event("error", text=f"stopped after {max_iters} steps", depth=depth)
