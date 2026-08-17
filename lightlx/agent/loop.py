@@ -9,7 +9,7 @@ from .providers import to_openai_messages
 from .tools import summarize_call
 from .types import ToolCall
 
-MAX_ITERS = 40
+MAX_ITERS = 80
 MAX_DEPTH = 1
 
 

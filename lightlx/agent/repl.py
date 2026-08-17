@@ -139,6 +139,7 @@ def make_printer():
     started = {"n": False}
     tool_stack = {}
     read_group = {"active": False, "names": []}
+    subagent_stack = {}
 
     def on_event(kind, text="", name="", detail="", depth=0, ok=True, **_):
         pad = "  " + ("  " * depth)
@@ -181,10 +182,17 @@ def make_printer():
             if started["n"]:
                 print()
                 started["n"] = False
-            print(_dim(f"{pad}▸ subagent {detail}"))
+            subagent_stack[name] = detail
+            # don't print start - wait for end to show one compact line
         elif kind == "subagent_end":
+            if started["n"]:
+                print()
+                started["n"] = False
+            detail = subagent_stack.pop(name, detail)
             mark = _ok("✓") if ok else _err("✗")
-            print(_dim(f"{pad}{mark} subagent {detail}"))
+            # one compact line for the whole subagent
+            short = detail[:60] + ("…" if len(detail) > 60 else "")
+            print(_dim(f"{pad}{mark} subagent: {short}"))
         elif kind == "compact":
             if started["n"]:
                 print()
@@ -216,6 +224,7 @@ def make_printer():
         tool_stack.clear()
         read_group["active"] = False
         read_group["names"] = []
+        subagent_stack.clear()
 
     on_event.reset = reset
     return on_event

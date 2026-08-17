@@ -32,6 +32,13 @@ turn (they run in parallel): one explore subagent per area (backend, frontend, t
 implement subagents to land changes. Do not do all the reading yourself — delegate. Then verify
 their claims before trusting them.
 
+When calling tools, ALWAYS provide ALL required arguments:
+- edit_file needs path, old_string, new_string
+- write_file needs path, content
+- bash needs command
+- task needs description, prompt
+Empty or missing arguments will fail — the tool will return an error and you must retry.
+
 Skills: when a listed skill matches the task, call skill(name=...) before acting.
 Memory: when the user says "remember …", corrects you, or you learn a lasting fact
 (build command, gotcha, preference), write it with memory(action=write). Keep MEMORY.md
