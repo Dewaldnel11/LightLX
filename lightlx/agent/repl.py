@@ -244,10 +244,7 @@ def _bind_events(sess, on_event):
 
 def _finish_turn(sess, result):
     sess.pending = None
-    if result.text:
-        sess.history.append({"role": "assistant", "content": result.text})
-    else:
-        sess.history.append({"role": "assistant", "content": "(done)"})
+    sess.history = [m for m in (result.messages or []) if m.get("role") != "system"]
     sess.persist()
 
 
