@@ -11,6 +11,7 @@ from collections import deque
 from pathlib import Path
 
 from .state import add_recent, add_recent_source, load_state, save_state
+from .agent.ui import ChatBar
 
 BANNER = r"""
   _    _       _     _   _    __  __
@@ -347,8 +348,8 @@ class Session:
 # ---------------------------------------------------------------- REPL + menus
 
 def _prompt_line(sess):
-    chips = sess.mode + ("·think" if sess.think else "") + ("·fast" if sess.fast and sess.is_glm else "")
-    return "\n" + _dim(chips) + "  " + _bold(sess.name) + " " + _bold("›") + " "
+    from .agent.ui import fallback_prompt
+    return fallback_prompt(sess)
 
 
 def set_tokens(sess, arg=None):
@@ -433,59 +434,82 @@ def settings_menu(sess) -> str:
 
 
 def repl(sess):
+    from .agent.loop import _fmt_dur
     print(_dim(f"\n  {sess.name} · {sess.mode} · {sess.max_tokens} tokens max · remembers the chat"))
     print(_dim("  message the model, or /menu for settings · /help · /clear · /exit"))
-    while True:
-        try:
-            line = input(_prompt_line(sess)).strip()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if not line:
-            continue
-        if line in ("/exit", "/quit", "exit", "quit", "/q"):
-            return
-        if line in ("/menu", "/", "/settings"):
-            action = settings_menu(sess)
-            if action == "quit":
+    bar = ChatBar()
+    bar.attach(sess)
+    bar.start()
+    try:
+        while True:
+            try:
+                line = bar.readline().strip()
+            except (EOFError, KeyboardInterrupt):
                 return
-            if action == "switch" and getattr(sess, "_pending_source", None):
-                return "switch"
-            continue
-        if line == "/help":
-            print(HELP)
-            continue
-        if line in ("/clear", "/reset", "/new"):
-            sess.history = []
-            print(_dim("  conversation cleared — fresh start"))
-            continue
-        if line == "/think":
-            sess.think = sess._pref["think"] = not sess.think
-            sess.persist()
-            print(_dim(f"  reasoning {'on — deeper, much slower' if sess.think else 'off'}"))
-            continue
-        if line == "/fast":
-            toggle_fast(sess)
-            continue
-        if line == "/model" or line == "/switch":
-            if switch_model(sess) and getattr(sess, "_pending_source", None):
-                return "switch"
-            continue
-        if line == "/agent":
-            return "agent"
-        if line.startswith("/tokens"):
-            parts = line.split()
-            set_tokens(sess, parts[1] if len(parts) == 2 else None)
-            continue
-        if line.startswith("/"):
-            print(_dim(f"  unknown command {line} — try /help"))
-            continue
-        sess.history.append({"role": "user", "content": line})
-        reply = generate(sess.model, sess.tok, sess.eos, sess.history, sess.max_tokens,
-                         verbose=True, think=sess.think, ctx_limit=sess.ctx_limit)
-        if reply:
-            sess.history.append({"role": "assistant", "content": reply})
-        else:
-            sess.history.pop()  # nothing generated — drop the dangling user turn
+            if not line:
+                continue
+            if line in ("/exit", "/quit", "exit", "quit", "/q"):
+                return
+            if line in ("/menu", "/", "/settings"):
+                with bar.paused():
+                    action = settings_menu(sess)
+                if action == "quit":
+                    return
+                if action == "switch" and getattr(sess, "_pending_source", None):
+                    return "switch"
+                continue
+            if line == "/help":
+                print(HELP)
+                continue
+            if line in ("/clear", "/reset", "/new"):
+                sess.history = []
+                sess.last_turn = None
+                print(_dim("  conversation cleared — fresh start"))
+                bar.refresh()
+                continue
+            if line == "/think":
+                sess.think = sess._pref["think"] = not sess.think
+                sess.persist()
+                print(_dim(f"  reasoning {'on — deeper, much slower' if sess.think else 'off'}"))
+                bar.refresh()
+                continue
+            if line == "/fast":
+                with bar.paused():
+                    toggle_fast(sess)
+                continue
+            if line == "/model" or line == "/switch":
+                with bar.paused():
+                    if switch_model(sess) and getattr(sess, "_pending_source", None):
+                        return "switch"
+                continue
+            if line == "/agent":
+                return "agent"
+            if line.startswith("/tokens"):
+                parts = line.split()
+                with bar.paused():
+                    set_tokens(sess, parts[1] if len(parts) == 2 else None)
+                bar.refresh()
+                continue
+            if line.startswith("/"):
+                print(_dim(f"  unknown command {line} — try /help"))
+                continue
+            sess.history.append({"role": "user", "content": line})
+            bar.busy = True
+            bar.refresh()
+            t0 = time.time()
+            reply = generate(sess.model, sess.tok, sess.eos, sess.history, sess.max_tokens,
+                             verbose=True, think=sess.think, ctx_limit=sess.ctx_limit)
+            dt = time.time() - t0
+            if reply:
+                sess.history.append({"role": "assistant", "content": reply})
+                ntok = max(1, len(reply) // 4)
+                sess.last_turn = {"steps": ntok, "dur": _fmt_dur(dt)}
+            else:
+                sess.history.pop()
+            bar.busy = False
+            bar.refresh()
+    finally:
+        bar.stop()
 
 
 # ---------------------------------------------------------------- entrypoint

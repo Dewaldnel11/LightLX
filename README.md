@@ -128,16 +128,13 @@ and **parallel subagents** for long-horizon work.
 $ lightlx
 
 Resume
-  1  refactor cli.py           ollama/qwen · 2h ago
-
-Recent
-  2  qwen2.5-coder:32b         ollama
+  1  LightLX                    qwen3.5-9b · 1h ago
 
 Connect
-  3  Local MLX folder          stream or resident
-  4  Ollama                    running · 6 models
-  5  LM Studio                 running · 2 models
-  6  Custom OpenAI URL         vLLM, llama.cpp, …
+  2  Local MLX folder          stream or resident
+  3  Ollama                    not running
+  4  LM Studio                 qwen/qwen3.5-9b
+  5  Custom OpenAI URL         vLLM, llama.cpp, …
 ```
 
 Pick a number. Local MLX then asks **Chat** or **Agent**. Ollama / LM Studio
@@ -165,11 +162,13 @@ Several `task` calls in one turn run **in parallel** (Ollama / LM Studio). Use
 everything else. Subagents cannot nest.
 
 ```
-  → task  map the auth flow
-  → task  find flaky tests
-    ✓ subagent: map the auth flow (12 steps, 45s)
-    ✗ subagent: find flaky tests — timed out (17 steps, 10m)
+  ✓ subagent: map the auth flow (12 steps, 45s)
+
+› 
+░████░░░ 2.1k/32k 6%  ·  qwen3.5-9b  ·  native  ·  last 4 · 12s  ·  LightLX
 ```
+
+The last line is a sticky chat bar: context used / window / percent, model, tool mode, last-turn cost, workspace. Type on the `›` line above it.
 
 Docs aliases: `claude-code`, `codex`, `ollama`, `lmstudio`, `mcp`, `lightlx` —
 or pass any `owner/repo`. Example: *“read the Codex AGENTS.md and match that

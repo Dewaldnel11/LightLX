@@ -27,16 +27,12 @@ Do not invent file paths — glob or list first if unsure.
 After changing code, run the relevant check (tests, lint, or a smoke command) when it exists.
 If a tool fails, diagnose and retry a different way. Do not loop on the same failing call.
 
-For large or multi-part tasks, split the work into SEVERAL task subagents launched in the SAME
-turn (they run in parallel): one explore subagent per area (backend, frontend, tests), plus
-implement subagents to land changes. Do not do all the reading yourself — delegate. Then verify
-their claims before trusting them.
+{subagents}
 
 When calling tools, ALWAYS provide ALL required arguments:
 - edit_file needs path, old_string, new_string
 - write_file needs path, content
 - bash needs command
-- task needs description, prompt
 Empty or missing arguments will fail — the tool will return an error and you must retry.
 
 Skills: when a listed skill matches the task, call skill(name=...) before acting.
@@ -46,6 +42,15 @@ a one-line-per-fact index; put detail in topic files (debugging.md, …).
 Project instruction files (LIGHTLX.md, AGENTS.md, CLAUDE.md) below override defaults.
 Workspace: {workspace}
 """
+
+SUBAGENTS_ON = """For large or multi-part tasks, split the work into SEVERAL task subagents launched in the SAME
+turn (they run in parallel): one explore subagent per area (backend, frontend, tests), plus
+implement subagents to land changes. Do not do all the reading yourself — delegate. Then verify
+their claims before trusting them.
+task needs description and prompt."""
+
+SUBAGENTS_OFF = """Do not spawn subagents or call a task tool — this model cannot run nested agents.
+Do the work yourself with read_file, edit_file, write_file, bash, grep, and glob."""
 
 TEXT_TOOLS = """
 When you need a tool, emit one or more blocks exactly like this (no extra prose inside the block):
@@ -68,8 +73,11 @@ Available tools:
 """
 
 
-def system_prompt(workspace: str, tools_as_text: bool = False, tool_list: str = "", extra: str = "") -> str:
-    text = IDENTITY.format(workspace=workspace)
+def system_prompt(workspace: str, tools_as_text: bool = False, tool_list: str = "", extra: str = "", subagents: bool = True) -> str:
+    text = IDENTITY.format(
+        workspace=workspace,
+        subagents=SUBAGENTS_ON if subagents else SUBAGENTS_OFF,
+    )
     if extra:
         text += "\n\n" + extra.strip()
     if tools_as_text:

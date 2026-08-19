@@ -48,6 +48,12 @@ def save_session(record: dict) -> str:
     os.makedirs(SESS_DIR, exist_ok=True)
     with open(path_for(sid), "w") as f:
         json.dump(_safe(record), f, indent=2)
+    key = project_key(record)
+    if key:
+        for rec in list_sessions(200, one_per_project=False):
+            other = rec.get("id")
+            if other and other != sid and project_key(rec) == key:
+                delete_session(other)
     return sid
 
 
@@ -65,7 +71,23 @@ def load_session(sid: str) -> dict | None:
         return None
 
 
-def list_sessions(limit=20):
+def project_key(rec) -> str:
+    ws = (rec or {}).get("workspace") or ""
+    if ws:
+        try:
+            return os.path.abspath(os.path.expanduser(str(ws))).lower()
+        except Exception:
+            return str(ws).strip().lower()
+    return str((rec or {}).get("id") or "")
+
+
+def project_name(rec) -> str:
+    ws = (rec or {}).get("workspace") or ""
+    name = os.path.basename(str(ws).rstrip("/")) if ws else ""
+    return name or (rec or {}).get("title") or (rec or {}).get("id") or "project"
+
+
+def list_sessions(limit=20, one_per_project=False):
     if not os.path.isdir(SESS_DIR):
         return []
     rows = []
@@ -80,6 +102,15 @@ def list_sessions(limit=20):
         except Exception:
             continue
     rows.sort(key=lambda d: d.get("updated") or d.get("created") or "", reverse=True)
+    if one_per_project:
+        seen, uniq = set(), []
+        for d in rows:
+            k = project_key(d)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            uniq.append(d)
+        rows = uniq
     return rows[:limit]
 
 
@@ -190,17 +221,30 @@ def history_for_save(messages):
     return out
 
 
+def id_for_workspace(workspace, current=None):
+    if current:
+        return current
+    key = project_key({"workspace": workspace})
+    if not key:
+        return new_id()
+    for rec in list_sessions(200, one_per_project=False):
+        if project_key(rec) == key:
+            return rec.get("id") or new_id()
+    return new_id()
+
+
 def record_from(sess, source=None):
     hist = history_for_save(
         [m for m in (sess.history or []) if m.get("role") in ("user", "assistant", "system", "tool")]
     )
     src = source or getattr(sess, "source", None) or {}
     pending = getattr(sess, "pending", None)
+    ws = str(sess.ws.root)
     return {
-        "id": getattr(sess, "session_id", None) or new_id(),
+        "id": id_for_workspace(ws, getattr(sess, "session_id", None)),
         "title": title_from(hist) or title_from(pending),
         "source": src,
-        "workspace": str(sess.ws.root),
+        "workspace": ws,
         "history": hist,
         "pending": pending or None,
         "in_progress": bool(pending),

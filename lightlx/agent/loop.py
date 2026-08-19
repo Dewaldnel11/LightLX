@@ -4,7 +4,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .context import maybe_compact
+from .context import completion_tokens, maybe_compact
 from .parse import looks_like_tool_narration, parse_text_tool_calls
 from .prompts import format_tool_list, system_prompt
 from .providers import to_openai_messages
@@ -275,8 +275,9 @@ def run_agent(
 
         try:
             payload = to_openai_messages(messages) if native_tools else messages
+            n_out = completion_tokens(payload, ctx, max_tokens)
             comp = provider.complete(
-                payload, tools=tools, max_tokens=max_tokens,
+                payload, tools=tools, max_tokens=n_out,
                 temperature=temperature, on_text=None,
             )
         except Exception as e:
@@ -392,10 +393,11 @@ def run_agent(
     return AgentResult(last or f"(stopped after {max_iters} steps)", messages, steps, status="max_iters")
 
 
-def seed_messages(workspace, registry, history, tools_as_text=False, extra=""):
+def seed_messages(workspace, registry, history, tools_as_text=False, extra="", subagents=True):
     sys = system_prompt(
         workspace, tools_as_text=tools_as_text,
         tool_list=format_tool_list(registry.values()), extra=extra,
+        subagents=subagents,
     )
     msgs = [{"role": "system", "content": sys}]
     msgs.extend(history)
@@ -491,7 +493,7 @@ class SubagentLauncher:
         history = [{"role": "user", "content": extra + "\n\n" + prompt}]
         messages = seed_messages(
             self.workspace, registry, history,
-            tools_as_text=not self.native_tools, extra=self.extra,
+            tools_as_text=not self.native_tools, extra=self.extra, subagents=False,
         )
         key = uuid.uuid4().hex[:8]
         t0 = time.time()

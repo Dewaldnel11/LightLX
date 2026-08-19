@@ -135,8 +135,24 @@ def detect_context(provider) -> int:
 
 def room_for(context_length, max_tokens) -> int:
     ctx = max(int(context_length or DEFAULT_CONTEXT), 1024)
-    reply = max(int(max_tokens or 0), 256)
+    cap = int(max_tokens or 0)
+    # Auto / "whole window" caps must not eat the compact budget.
+    if cap <= 0 or cap > ctx // 2:
+        reply = min(max(ctx // 4, 2048), ctx // 2)
+    else:
+        reply = max(cap, 256)
     return max(ctx - reply - 256, 512)
+
+
+def completion_tokens(messages, context_length, cap=0) -> int:
+    """Tokens the model may emit this call: remaining context, optionally capped."""
+    ctx = max(int(context_length or DEFAULT_CONTEXT), 256)
+    used = estimate_tokens(messages)
+    room = max(ctx - used - 64, 256)
+    cap = int(cap or 0)
+    if cap > 0:
+        room = min(room, cap)
+    return room
 
 
 def needs_compact(messages, context_length, max_tokens, ratio=COMPACT_RATIO) -> bool:

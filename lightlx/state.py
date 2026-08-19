@@ -13,7 +13,7 @@ DEFAULTS = {
     "prefs": {
         "think": False,
         "max_tokens": 512,
-        "agent_max_tokens": 4096,
+        "agent_max_tokens": 0,
         "temperature": 0.2,
         "ollama_url": "",
         "lmstudio_url": "",

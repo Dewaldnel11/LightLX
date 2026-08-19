@@ -194,6 +194,12 @@ class PromptTests(unittest.TestCase):
         text = system_prompt("/tmp/ws", tools_as_text=True, tool_list=format_tool_list([spec]))
         self.assertIn("/tmp/ws", text)
         self.assertIn("read_file", text)
+        self.assertIn("task subagents", text)
+
+    def test_system_omits_task_when_no_subagents(self):
+        text = system_prompt("/tmp/ws", subagents=False)
+        self.assertIn("cannot run nested agents", text)
+        self.assertNotIn("task needs description", text)
 
 
 class ParseArgsTests(unittest.TestCase):
@@ -242,6 +248,17 @@ class ContextTests(unittest.TestCase):
         note = handoff_note("ollama/a", "lmstudio/b", 32768)
         self.assertIn("handoff", note["content"])
         self.assertIn("32768", note["content"])
+
+    def test_completion_tokens_uses_remaining_window(self):
+        from lightlx.agent.context import completion_tokens, room_for
+        msgs = [{"role": "user", "content": "hi"}]
+        n = completion_tokens(msgs, context_length=50432, cap=0)
+        self.assertGreater(n, 40_000)
+        n_cap = completion_tokens(msgs, context_length=50432, cap=2048)
+        self.assertEqual(n_cap, 2048)
+        # auto cap must leave compact headroom
+        self.assertGreater(room_for(50432, 0), 10_000)
+        self.assertGreater(room_for(50432, 50432), 10_000)
 
     def test_sanitize_drops_orphan_tools(self):
         from lightlx.agent.context import sanitize_messages
@@ -317,6 +334,83 @@ class SessionStoreTests(unittest.TestCase):
         finally:
             sessions.SESS_DIR = old
             tmp.cleanup()
+
+    def test_one_resume_per_project(self):
+        from lightlx.agent import sessions
+        old = sessions.SESS_DIR
+        tmp = tempfile.TemporaryDirectory()
+        sessions.SESS_DIR = tmp.name
+        try:
+            a = sessions.save_session({
+                "title": "old", "workspace": "/tmp/proj",
+                "history": [{"role": "user", "content": "old"}],
+            })
+            b = sessions.save_session({
+                "title": "new", "workspace": "/tmp/proj",
+                "history": [{"role": "user", "content": "new"}],
+            })
+            self.assertNotEqual(a, b)
+            rows = sessions.list_sessions(10, one_per_project=True)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["id"], b)
+            self.assertIsNone(sessions.load_session(a))
+            other = sessions.save_session({
+                "title": "other", "workspace": "/tmp/other",
+                "history": [{"role": "user", "content": "x"}],
+            })
+            rows = sessions.list_sessions(10, one_per_project=True)
+            ids = {r["id"] for r in rows}
+            self.assertEqual(ids, {b, other})
+            self.assertEqual(sessions.project_name({"workspace": "/tmp/proj"}), "proj")
+        finally:
+            sessions.SESS_DIR = old
+            tmp.cleanup()
+
+
+class LoadedModelTests(unittest.TestCase):
+    def test_split_lmstudio_models(self):
+        from lightlx.agent.providers import split_lmstudio_models
+        rows = [
+            {"id": "qwen/qwen3.5-9b", "type": "vlm", "state": "loaded"},
+            {"id": "google/gemma-4-e4b", "type": "vlm", "state": "not-loaded"},
+            {"id": "text-embedding-nomic-embed-text-v1.5", "type": "embeddings", "state": "not-loaded"},
+        ]
+        loaded, listed = split_lmstudio_models(rows)
+        self.assertEqual(loaded, ["qwen/qwen3.5-9b"])
+        self.assertEqual(listed, ["qwen/qwen3.5-9b", "google/gemma-4-e4b"])
+
+    def test_infer_caps_tools_and_subagents(self):
+        from lightlx.agent.providers import infer_caps, runtime_notice
+        details = {
+            "qwen": {"capabilities": ["tool_use"], "context": 50432},
+            "tiny": {"capabilities": ["tool_use"], "context": 4096},
+            "plain": {"capabilities": [], "context": 32768},
+            "unknown": {"capabilities": None, "context": 32768},
+        }
+        q = infer_caps(details, "qwen")
+        self.assertTrue(q["tools"])
+        self.assertTrue(q["subagents"])
+        t = infer_caps(details, "tiny")
+        self.assertTrue(t["tools"])
+        self.assertFalse(t["subagents"])
+        p = infer_caps(details, "plain")
+        self.assertFalse(p["tools"])
+        self.assertFalse(p["subagents"])
+        u = infer_caps(details, "unknown")
+        self.assertTrue(u["tools"])
+        self.assertTrue(u["subagents"])
+        first = runtime_notice(None, {"model": "qwen", "caps": q})
+        self.assertEqual(first, [])
+        inline = runtime_notice(None, {"model": "tiny", "caps": t})
+        self.assertTrue(any("inline" in line for line in inline))
+        switch = runtime_notice(
+            {"model": "tiny", "caps": t},
+            {"model": "qwen", "caps": q},
+        )
+        self.assertTrue(any("qwen" in line for line in switch))
+        self.assertTrue(any("subagents enabled" in line for line in switch))
+        same = runtime_notice({"model": "tiny", "caps": t}, {"model": "tiny", "caps": t})
+        self.assertEqual(same, [])
 
 
 class SkillsMemoryTests(unittest.TestCase):
@@ -529,6 +623,42 @@ class SessionPersistTests(unittest.TestCase):
             if m.get("role") == "assistant" and m.get("content") == "all good"
         )
         self.assertFalse(orphan_asst.get("tool_calls"))
+
+
+class ChatBarTests(unittest.TestCase):
+    def test_fmt_and_bar(self):
+        from lightlx.agent.ui import ctx_usage, fmt_tok, format_bar, meter, short_model
+        self.assertEqual(fmt_tok(512), "512")
+        self.assertEqual(fmt_tok(1500), "1.5k")
+        self.assertEqual(fmt_tok(12000), "12k")
+        self.assertEqual(meter(0, 8), "░░░░░░░░")
+        self.assertEqual(meter(100, 8), "████████")
+        self.assertEqual(len(meter(50, 8)), 8)
+
+        class Sess:
+            history = [{"role": "user", "content": "x" * 400}]
+            context_length = 8192
+            native_tools = True
+            max_tokens = 4096
+            provider = type("P", (), {"label": "lmstudio/qwen/qwen3.5-9b"})()
+            ws = type("W", (), {"root": "/tmp/LightLX"})()
+            last_turn = {"steps": 4, "dur": "12s"}
+            max_tokens = 0
+
+        sess = Sess()
+        self.assertEqual(short_model(sess), "qwen3.5-9b")
+        used, ctx, pct = ctx_usage(sess)
+        self.assertEqual(ctx, 8192)
+        self.assertGreater(used, 0)
+        self.assertGreaterEqual(pct, 0)
+        bar = format_bar(sess, cols=80, color=False)
+        self.assertIn("qwen3.5-9b", bar)
+        self.assertIn("native", bar)
+        self.assertIn("last 4", bar)
+        self.assertIn("LightLX", bar)
+        self.assertEqual(len(bar), 80)
+        busy = format_bar(sess, cols=60, busy=True, color=False)
+        self.assertIn("working", busy)
 
 
 if __name__ == "__main__":

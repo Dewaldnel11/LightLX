@@ -9,7 +9,7 @@ from .providers import (
     probe_lmstudio,
     probe_ollama,
 )
-from .sessions import age, list_sessions
+from .sessions import age, list_sessions, project_name
 
 
 def _dim(s):
@@ -34,8 +34,13 @@ def _clean(p):
 
 def pick_remote_model(title, models, url):
     print(f"\n{title}")
+    models = [m for m in (models or []) if m]
+    if len(models) == 1:
+        print(_dim(f"  using {models[0]}"))
+        return models[0]
     if not models:
-        print(_dim(f"  no models at {url}"))
+        print(_dim(f"  no loaded model at {url}"))
+        print(_dim("  load a model in the app, then pick this again — or type a name"))
         try:
             raw = _ask()
         except (EOFError, KeyboardInterrupt):
@@ -54,6 +59,25 @@ def pick_remote_model(title, models, url):
         if raw.isdigit() and 1 <= int(raw) <= len(models):
             return models[int(raw) - 1]
         return raw
+
+
+def _loaded_names(info):
+    if not info:
+        return []
+    return list(info.get("loaded") or []) or list(info.get("models") or [])
+
+
+def _backend_status(info, down):
+    if not info:
+        return down
+    if info.get("auth_required") and not _loaded_names(info):
+        return "running · needs API token"
+    loaded = list(info.get("loaded") or [])
+    if loaded:
+        return loaded[0] if len(loaded) == 1 else f"{len(loaded)} loaded"
+    if info.get("listed") or info.get("models"):
+        return "running · nothing loaded"
+    return "running"
 
 
 def pick_custom():
@@ -83,11 +107,16 @@ def pick_source(state, is_model_dir, pick_local):
     ollama = probe_ollama(ollama_url)
     lmstudio = probe_lmstudio(lm_url, api_key=lm_key)
     recents = []
+    loaded_ids = set(_loaded_names(ollama) + _loaded_names(lmstudio))
     for s in state.get("recent_sources", []):
         if not s.get("kind") or not s.get("key"):
             continue
         if s["kind"] == "mlx" and not is_model_dir(s["key"]):
             continue
+        if s["kind"] in ("lmstudio", "ollama") and loaded_ids:
+            key = s.get("key") or ""
+            if not any(key == n or key.endswith(n) or n.endswith(key) for n in loaded_ids):
+                continue
         recents.append(s)
     if not recents:
         recents = [{"kind": "mlx", "key": p, "label": os.path.basename(p.rstrip("/"))}
@@ -95,17 +124,20 @@ def pick_source(state, is_model_dir, pick_local):
 
     items = []
     print()
-    sessions = list_sessions(5)
+    sessions = list_sessions(8, one_per_project=True)
     if sessions:
         print("Resume")
         for s in sessions:
             items.append(("resume", s))
-            title = (s.get("title") or s.get("id") or "session")[:36]
-            mark = "● " if s.get("in_progress") or s.get("pending") else ""
-            meta = f"{s.get('provider') or s.get('kind') or '?'} · {age(s.get('updated'))}"
-            if mark:
+            title = project_name(s)
+            if s.get("in_progress") or s.get("pending"):
+                title = "● " + title
+            prov = s.get("provider") or s.get("kind") or "?"
+            if "/" in str(prov):
+                prov = str(prov).rsplit("/", 1)[-1]
+            meta = f"{prov} · {age(s.get('updated'))}"
+            if s.get("in_progress") or s.get("pending"):
                 meta = "in progress · " + meta
-            title = mark + title
             print(f"  {len(items)}  {title:<28} {_dim(meta)}")
         print()
     if recents:
@@ -119,19 +151,9 @@ def pick_source(state, is_model_dir, pick_local):
     items.append(("mlx", None))
     print(f"  {len(items)}  Local MLX folder           {_dim('stream or resident')}")
     items.append(("ollama", ollama))
-    if ollama:
-        n = len(ollama["models"])
-        print(f"  {len(items)}  Ollama                     {_dim('running · ' + str(n) + ' models')}")
-    else:
-        print(f"  {len(items)}  Ollama                     {_dim('not running · ' + ollama_url)}")
+    print(f"  {len(items)}  Ollama                     {_dim(_backend_status(ollama, 'not running · ' + ollama_url))}")
     items.append(("lmstudio", lmstudio))
-    if lmstudio and lmstudio.get("auth_required") and not lmstudio.get("models"):
-        print(f"  {len(items)}  LM Studio                  {_dim('running · needs API token')}")
-    elif lmstudio:
-        n = len(lmstudio.get("models") or [])
-        print(f"  {len(items)}  LM Studio                  {_dim('running · ' + str(n) + ' models')}")
-    else:
-        print(f"  {len(items)}  LM Studio                  {_dim('not running · ' + lm_url)}")
+    print(f"  {len(items)}  LM Studio                  {_dim(_backend_status(lmstudio, 'not running · ' + lm_url))}")
     items.append(("openai", None))
     print(f"  {len(items)}  Custom OpenAI URL          {_dim('vLLM, llama.cpp, …')}")
     print(_dim("\nPick a number — or drag in / paste a model folder.  (q to quit)"))
@@ -229,7 +251,7 @@ def _pick_ollama(info, url):
         if info is None:
             print(_dim(f"  still not running at {url}"))
             return None
-    name = pick_remote_model("Ollama models", info["models"], url)
+    name = pick_remote_model("Ollama models", _loaded_names(info) or info["models"], url)
     if not name:
         return None
     return {"kind": "ollama", "model": name, "url": info["url"]}
@@ -286,7 +308,11 @@ def _pick_lmstudio(info, url, state=None):
             print(_dim(f"  still not running at {url}"))
             return None
         key = info.get("api_key") or key
-    name = pick_remote_model("LM Studio models", info.get("models") or [], info.get("url") or url)
+    name = pick_remote_model(
+        "LM Studio models",
+        _loaded_names(info),
+        info.get("url") or url,
+    )
     if not name:
         return None
     return {"kind": "lmstudio", "model": name, "url": info.get("url") or url, "api_key": info.get("api_key") or key}

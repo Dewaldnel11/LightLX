@@ -16,3 +16,4 @@ models/
 .cache/
 LIGHTLX.local.md
 CLAUDE.local.md
+.zcode/

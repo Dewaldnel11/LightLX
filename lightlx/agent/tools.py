@@ -436,6 +436,8 @@ class BuiltinTools:
             want_fork = want_fork.lower() in ("true", "1", "yes", "on")
         if want_fork and self.launch_task:
             return self.launch_task(sk.name, body, sk.agent_kind)
+        if want_fork:
+            return "(subagents not available — run this skill inline)\n\n" + body
         return body
 
     def memory_tool(self, action, path="MEMORY.md", content=""):

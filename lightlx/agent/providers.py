@@ -70,7 +70,14 @@ def probe_ollama(base=None):
         return None
     data = r.get("data") or {}
     names = [m.get("name") or m.get("model") for m in data.get("models") or [] if m.get("name") or m.get("model")]
-    return {"url": base, "models": names}
+    loaded = []
+    ps = probe(base + "/api/ps")
+    if ps.get("ok"):
+        for m in ((ps.get("data") or {}).get("models") or []):
+            n = m.get("name") or m.get("model")
+            if n:
+                loaded.append(n)
+    return {"url": base, "models": loaded or names, "listed": names, "loaded": loaded}
 
 
 def _lmstudio_keys(explicit=None):
@@ -101,24 +108,205 @@ def _chat_model_ids(rows):
     return chat + other
 
 
+def split_lmstudio_models(rows):
+    """Return (loaded_chat, listed_chat) from LM Studio /api/v0/models rows."""
+    loaded, listed, _ = parse_lmstudio_rows(rows)
+    return loaded, listed
+
+
+def parse_lmstudio_rows(rows):
+    loaded, listed, details = [], [], {}
+    for m in rows or []:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id") or m.get("name")
+        if not mid:
+            continue
+        blob = " ".join(str(m.get(k) or "") for k in ("id", "type", "object")).lower()
+        if "embed" in blob:
+            continue
+        listed.append(mid)
+        state = str(m.get("state") or "").lower()
+        is_loaded = state in ("loaded", "loading", "idle") or m.get("loaded") is True
+        if is_loaded:
+            loaded.append(mid)
+        details[mid] = {
+            "capabilities": (
+                [str(c).lower() for c in m["capabilities"]]
+                if isinstance(m.get("capabilities"), list) else None
+            ),
+            "context": m.get("loaded_context_length") or m.get("max_context_length"),
+            "state": state,
+            "type": m.get("type") or "",
+        }
+    return loaded, listed, details
+
+
+def caps_from_list(raw):
+    caps = [str(c).lower().replace("-", "_") for c in (raw or [])]
+    tools = any(
+        c in ("tool_use", "tools", "tool", "function_calling", "functions")
+        for c in caps
+    )
+    return {"tools": tools, "raw": caps}
+
+
+def infer_caps(details, model_id, context_length=0):
+    d = (details or {}).get(model_id) or {}
+    raw = d.get("capabilities")
+    if raw is None:
+        info = {"tools": True, "raw": []}
+    else:
+        info = caps_from_list(raw)
+    ctx = int(d.get("context") or context_length or 0)
+    info["context"] = ctx
+    info["subagents"] = bool(info["tools"] and (not ctx or ctx >= 8192))
+    return info
+
+
+def runtime_notice(old, new):
+    """Human lines for a model/capability change. old/new are dicts with model, caps."""
+    if not new:
+        return []
+    lines = []
+    caps = new.get("caps") or {}
+    old_caps = (old or {}).get("caps") or {}
+    model_changed = bool(
+        old and old.get("model") and new.get("model") and old["model"] != new["model"]
+    )
+    if model_changed:
+        lines.append(f"loaded model is now {new['model']}")
+    tools = bool(caps.get("tools"))
+    subs = bool(caps.get("subagents"))
+    old_tools = bool(old_caps.get("tools")) if old else None
+    old_subs = bool(old_caps.get("subagents")) if old else None
+    if not tools:
+        if old is None or old_tools is not False:
+            lines.append(
+                "this model does not advertise tool calling — "
+                "using text tool format, running inline (no subagents)"
+            )
+    elif not subs:
+        if old is None or old_subs:
+            lines.append("this model can use tools but not nested subagents — running inline")
+    elif old is not None and (not old_tools or not old_subs):
+        lines.append("tools + subagents enabled")
+    return lines
+
+
 def probe_lmstudio(base=None, api_key=None):
     base = (base or DEFAULT_LMSTUDIO).rstrip("/")
     last = None
     for key in _lmstudio_keys(api_key):
+        r0 = probe(base + "/api/v0/models", api_key=key)
+        last = r0
+        if r0.get("ok"):
+            rows = (r0.get("data") or {}).get("data") or (r0.get("data") or {}).get("models") or []
+            loaded, listed, details = parse_lmstudio_rows(rows)
+            if not listed:
+                r = probe(base + "/v1/models", api_key=key)
+                listed = _chat_model_ids((r.get("data") or {}).get("data")) if r.get("ok") else []
+            return {
+                "url": base,
+                "models": loaded or listed,
+                "loaded": loaded,
+                "listed": listed,
+                "details": details,
+                "api_key": key,
+            }
         r = probe(base + "/v1/models", api_key=key)
         last = r
         if r.get("ok"):
             names = _chat_model_ids((r.get("data") or {}).get("data"))
-            return {"url": base, "models": names, "api_key": key}
-        if r.get("status") == 0:
+            fb = _lms_cli_probe() or {}
+            loaded = list(fb.get("models") or [])
+            loaded = [n for n in loaded if n in names] or loaded
+            return {
+                "url": base,
+                "models": loaded or names,
+                "loaded": loaded,
+                "listed": names,
+                "api_key": key,
+            }
+        if r.get("status") == 0 and r0.get("status") == 0:
             break
     if last and last.get("auth_required"):
-        return {"url": base, "models": [], "auth_required": True}
+        return {"url": base, "models": [], "loaded": [], "auth_required": True}
     fb = _lms_cli_probe()
     if fb:
         fb.setdefault("url", base)
+        fb.setdefault("loaded", list(fb.get("models") or []))
+        fb.setdefault("listed", list(fb.get("models") or []))
         return fb
     return None
+
+
+def ollama_model_caps(base, model):
+    if not base or not model:
+        return {}
+    try:
+        data, _ = http_json("POST", base.rstrip("/") + "/api/show", {"name": model}, timeout=8)
+    except Exception:
+        return {}
+    caps = data.get("capabilities") or []
+    info = caps_from_list(caps)
+    if not info["tools"]:
+        tmpl = str(data.get("template") or "") + " " + str(data.get("modelfile") or "")
+        info["tools"] = "tool" in tmpl.lower() or ".Tools" in tmpl
+    return info
+
+
+def refresh_remote_provider(provider):
+    """Follow the currently loaded model and return {model, caps} or None."""
+    kind = getattr(provider, "kind", "")
+    if kind not in ("lmstudio", "ollama"):
+        ctx = int(getattr(provider, "context_length", 0) or 0)
+        tools = True
+        return {
+            "model": getattr(provider, "model", None) or getattr(provider, "label", ""),
+            "caps": {"tools": tools, "subagents": bool(not ctx or ctx >= 8192), "raw": [], "context": ctx},
+        }
+    if kind == "lmstudio":
+        info = probe_lmstudio(getattr(provider, "base_url", None), getattr(provider, "api_key", None))
+        if not info:
+            return None
+        loaded = list(info.get("loaded") or [])
+        current = getattr(provider, "model", "")
+        model = current if current in loaded else (loaded[0] if loaded else current)
+        if model and model != current:
+            provider.model = model
+            provider.label = f"lmstudio/{model}"
+        details = info.get("details") or {}
+        ctx = 0
+        d = details.get(model) or {}
+        try:
+            ctx = int(d.get("context") or 0)
+        except (TypeError, ValueError):
+            ctx = 0
+        if ctx:
+            provider.context_length = ctx
+        caps = infer_caps(details, model, ctx)
+        provider.capabilities = caps
+        return {"model": model, "caps": caps}
+    info = probe_ollama(getattr(provider, "base_url", None))
+    if not info:
+        return None
+    loaded = list(info.get("loaded") or [])
+    current = getattr(provider, "model", "")
+    model = current if current in loaded else (loaded[0] if loaded else current)
+    if model and model != current:
+        provider.model = model
+        provider.label = f"ollama/{model}"
+    ocap = ollama_model_caps(info.get("url") or getattr(provider, "base_url", ""), model)
+    ctx = int(getattr(provider, "context_length", 0) or 0)
+    caps = {
+        "tools": ocap.get("tools", True) if ocap else True,
+        "raw": (ocap or {}).get("raw") or [],
+        "context": ctx,
+        "subagents": bool((ocap.get("tools", True) if ocap else True) and (not ctx or ctx >= 8192)),
+    }
+    provider.capabilities = caps
+    return {"model": model, "caps": caps}
 
 
 def _lms_cli_probe():

@@ -4,6 +4,8 @@ import time
 
 from .context import detect_context, estimate_tokens, handoff_note, maybe_compact
 from .loop import SubagentLauncher, _fmt_dur, _git_snapshot, run_agent, seed_messages
+from .ui import ChatBar
+from .providers import refresh_remote_provider, runtime_notice
 from .mcp import MCPHub, load_mcp_config
 from .memory import format_instructions, init_project, load_instructions
 from .memory import MemoryStore
@@ -23,7 +25,7 @@ HELP = """commands
   /docs          documentation sources (claude-code, codex, …)
   /workspace     show or set the working directory
   /task          reminder: ask the model to spawn parallel subagents
-  /tokens N      max tokens per model call
+  /tokens auto|N  reply cap (auto = remaining context)
   /compact       summarize older turns to free context
   /resume        resume a saved session
   /save          snapshot this session now
@@ -58,18 +60,53 @@ class AgentSession:
         self.prefs = prefs
         self.on_switch = on_switch
         self.native_tools = native_tools
+        self.allow_subagents = True
+        self._runtime = None
         self.source = source or {}
         self.history = []
         self.pending = None
         self.session_id = None
+        self.last_turn = None
         self.hub = MCPHub()
-        self.max_tokens = int(prefs.get("agent_max_tokens") or prefs.get("max_tokens") or 4096)
         self.temperature = float(prefs.get("temperature") or 0.1)
         self.context_length = detect_context(provider)
+        raw_max = prefs.get("agent_max_tokens", 0)
+        try:
+            raw_max = int(raw_max)
+        except (TypeError, ValueError):
+            raw_max = 0
+        # 4096 was the old built-in cap; 0 = use the model's remaining context.
+        self.max_tokens = 0 if raw_max in (0, 4096) else max(raw_max, 0)
         self.memory = MemoryStore(self.ws.root)
         self.skills = discover_skills(self.ws.root)
         self.instructions = load_instructions(self.ws.root)
         self._connect_mcp()
+        self._notices = self.refresh_runtime(announce=True)
+
+    def apply_runtime(self, runtime, announce=False):
+        if not runtime:
+            return []
+        old = self._runtime
+        caps = runtime.get("caps") or {}
+        model_changed = bool(old and old.get("model") and runtime.get("model") and old["model"] != runtime["model"])
+        self.allow_subagents = bool(caps.get("subagents", True))
+        if caps.get("tools") is False:
+            self.native_tools = False
+        elif model_changed:
+            self.native_tools = True
+        ctx = caps.get("context")
+        if ctx:
+            self.context_length = int(ctx)
+        notes = runtime_notice(old, runtime) if announce else []
+        self._runtime = runtime
+        return notes
+
+    def refresh_runtime(self, announce=False):
+        try:
+            runtime = refresh_remote_provider(self.provider)
+        except Exception:
+            runtime = None
+        return self.apply_runtime(runtime, announce=announce)
 
     def reload_knowledge(self):
         self.memory = MemoryStore(self.ws.root)
@@ -110,10 +147,8 @@ class AgentSession:
         self.hub.connect(cfg, str(self.ws.root), on_status=None)
 
     def make_registry(self, kind="general", depth=0):
-        include_task = depth < 1
+        include_task = depth < 1 and kind != "explore" and self.allow_subagents
         readonly = kind == "explore"
-        if kind == "explore":
-            include_task = False
         launcher = None
         if include_task:
             launcher = SubagentLauncher(
@@ -253,7 +288,7 @@ def make_printer():
 
 def _bind_events(sess, on_event):
     def make_registry(kind="general", depth=0):
-        include_task = depth < 1 and kind != "explore"
+        include_task = depth < 1 and kind != "explore" and getattr(sess, "allow_subagents", True)
         readonly = kind == "explore"
         launcher = None
         if include_task:
@@ -277,9 +312,14 @@ def _tools_http_rejected(err):
     return msg.startswith("400")
 
 
-def _finish_turn(sess, result):
+def _finish_turn(sess, result, dur=None):
     sess.pending = None
     sess.history = [m for m in (result.messages or []) if m.get("role") != "system"]
+    sess.last_turn = {
+        "steps": getattr(result, "steps", 0),
+        "dur": _fmt_dur(dur or 0),
+        "status": getattr(result, "status", "done"),
+    }
     if sess.native_tools:
         used = any(m.get("role") == "tool" for m in result.messages or [])
         if used:
@@ -310,14 +350,17 @@ def _finish_turn(sess, result):
 
 
 def resume_pending(sess, on_event):
+    for line in sess.refresh_runtime(announce=True):
+        print(_dim("  " + line))
     registry = _bind_events(sess, on_event)
     rest = hydrate_messages(sess.pending)
     messages = seed_messages(
         str(sess.ws.root), registry(kind="general", depth=0),
         rest, tools_as_text=not sess.native_tools,
-        extra=sess.prompt_extra(),
+        extra=sess.prompt_extra(), subagents=sess.allow_subagents,
     )
     print(_dim("  resuming in-flight turn…"))
+    t0 = time.time()
     try:
         result = run_agent(
             sess.provider, messages, registry(kind="general", depth=0),
@@ -336,10 +379,12 @@ def resume_pending(sess, on_event):
             return resume_pending(sess, on_event)
         print(_dim(f"\n  {e}"))
         return
-    _finish_turn(sess, result)
+    _finish_turn(sess, result, dur=time.time() - t0)
 
 
 def run_turn(sess, user_text, on_event):
+    for line in sess.refresh_runtime(announce=True):
+        print(_dim("  " + line))
     registry = _bind_events(sess, on_event)
     sess.history.append({"role": "user", "content": user_text})
     sess.history, _ = maybe_compact(
@@ -348,9 +393,10 @@ def run_turn(sess, user_text, on_event):
     messages = seed_messages(
         str(sess.ws.root), registry(kind="general", depth=0),
         sess.history, tools_as_text=not sess.native_tools,
-        extra=sess.prompt_extra(),
+        extra=sess.prompt_extra(), subagents=sess.allow_subagents,
     )
     sess.checkpoint(messages)
+    t0 = time.time()
     try:
         result = run_agent(
             sess.provider, messages, registry(kind="general", depth=0),
@@ -375,20 +421,18 @@ def run_turn(sess, user_text, on_event):
         sess.pending = None
         sess.persist()
         return
-    _finish_turn(sess, result)
+    _finish_turn(sess, result, dur=time.time() - t0)
 
 
 def _prompt_line(sess):
-    used = estimate_tokens(sess.history)
-    ctx = sess.context_length or 0
-    ctx_s = f"{used}/{ctx}" if ctx else str(used)
-    return "\n" + _dim(f"{ctx_s}") + "  " + _bold(sess.provider.label) + " " + _bold("›") + " "
+    from .ui import fallback_prompt
+    return fallback_prompt(sess)
 
 
 def settings_menu(sess):
     while True:
         print("\n  " + _bold("Settings") + _dim("   number · Enter to back"))
-        print(f"   1  Reply length   {_bold(str(sess.max_tokens))}")
+        print(f"   1  Reply length   {_bold('auto' if not sess.max_tokens else str(sess.max_tokens))}")
         print(f"   2  Workspace      {_dim(str(sess.ws.root))}")
         print(f"   3  Handoff model")
         print(f"   4  Reload MCP     {_dim(str(len(sess.hub.servers)) + ' connected')}")
@@ -402,10 +446,13 @@ def settings_menu(sess):
             return ""
         if c == "1":
             try:
-                val = input(_dim(f"  tokens (now {sess.max_tokens}) › ")).strip()
+                val = input(_dim(f"  tokens (now {'auto' if not sess.max_tokens else sess.max_tokens}; 0 = auto) › ")).strip()
             except (EOFError, KeyboardInterrupt):
                 continue
-            if val.isdigit() and int(val) > 0:
+            if val.lower() in ("auto", "max", "0"):
+                sess.max_tokens = sess.prefs["agent_max_tokens"] = 0
+                print(_dim("  reply length = auto (model window)"))
+            elif val.isdigit() and int(val) > 0:
                 sess.max_tokens = sess.prefs["agent_max_tokens"] = int(val)
                 print(_dim(f"  reply length = {sess.max_tokens}"))
         elif c == "2":
@@ -459,13 +506,13 @@ def _do_compact(sess):
 
 
 def _pick_resume():
-    rows = list_sessions(15)
+    rows = list_sessions(15, one_per_project=True)
     if not rows:
         print(_dim("  no saved sessions"))
         return None
     print("\n  " + _bold("Sessions"))
     for i, s in enumerate(rows, 1):
-        label = s.get("title") or "untitled"
+        label = project_name(s)
         if s.get("in_progress") or s.get("pending"):
             label = "● " + label
         meta = f"{s.get('provider') or s.get('kind') or '?'} · {age(s.get('updated'))}"
@@ -539,134 +586,180 @@ def agent_repl(sess, switch_cb=None):
     ctx = sess.context_length
     print(_dim(f"\n  {sess.provider.label}  ·  ctx {ctx}"))
     print(_dim(f"  {sess.ws.root}"))
+    for line in getattr(sess, "_notices", []) or []:
+        print(_dim("  " + line))
+    sess._notices = []
     print(_dim("  /menu · /skills · /memory · /help · /exit"))
     printer = make_printer()
-    if sess.pending:
-        resume_pending(sess, printer)
-    while True:
-        try:
-            line = input(_prompt_line(sess)).strip()
-        except (EOFError, KeyboardInterrupt):
-            sess.persist()
-            return
-        if not line:
-            continue
-        if line in ("/exit", "/quit", "exit", "quit", "/q"):
-            sess.persist()
-            return
-        if line in ("/menu", "/", "/settings"):
-            action = settings_menu(sess)
-            if action == "quit":
+    bar = ChatBar()
+    bar.attach(sess)
+
+    def on_event(kind, **kw):
+        printer(kind, **kw)
+        if kind in ("tool_end", "subagent_end", "turn_end", "compact_done", "error"):
+            bar.refresh()
+
+    on_event.reset = printer.reset
+    bar.start()
+    try:
+        if sess.pending:
+            bar.busy = True
+            bar.refresh()
+            resume_pending(sess, on_event)
+            bar.busy = False
+            bar.refresh()
+        while True:
+            try:
+                line = bar.readline().strip()
+            except (EOFError, KeyboardInterrupt):
                 sess.persist()
                 return
-            if action == "switch":
+            if not line:
+                continue
+            if line in ("/exit", "/quit", "exit", "quit", "/q"):
+                sess.persist()
+                return
+            if line in ("/menu", "/", "/settings"):
+                with bar.paused():
+                    action = settings_menu(sess)
+                if action == "quit":
+                    sess.persist()
+                    return
+                if action == "switch":
+                    sess.persist()
+                    return "switch"
+                continue
+            if line == "/help":
+                print(HELP)
+                continue
+            if line in ("/clear", "/reset", "/new"):
+                sess.persist()
+                sess.history = []
+                sess.pending = None
+                sess.session_id = None
+                sess.last_turn = None
+                print(_dim("  conversation cleared — new session"))
+                bar.refresh()
+                continue
+            if line == "/tools":
+                for spec in sess.make_registry().values():
+                    src = f"  {_dim(spec.source)}" if spec.source != "builtin" else ""
+                    print(f"  {spec.name}{src}")
+                continue
+            if line == "/docs":
+                print(_dim("  aliases → GitHub repos (tool: docs)"))
+                seen = {}
+                for k, v in DOC_ALIASES.items():
+                    seen.setdefault(v, []).append(k)
+                for repo, aliases in seen.items():
+                    print(f"  {', '.join(aliases):<28} {repo}")
+                print(_dim("  or pass any owner/repo"))
+                continue
+            if line == "/mcp":
+                if sess.hub.servers:
+                    for line_s in sess.hub.summary():
+                        print("  " + line_s)
+                else:
+                    print(_dim("  no MCP servers. add ~/.lightlx/mcp.json  (see /help)"))
+                continue
+            if line == "/task":
+                if not sess.allow_subagents:
+                    print(_dim("  this model cannot run nested subagents — work stays in this chat (inline)"))
+                else:
+                    print(_dim("  ask the model to use the task tool — several in one turn run in parallel"))
+                    print(_dim("  types: explore (read-only) · implement · general"))
+                continue
+            if line.startswith("/workspace"):
+                parts = line.split(maxsplit=1)
+                with bar.paused():
+                    _set_workspace(sess, parts[1] if len(parts) == 2 else None)
+                continue
+            if line.startswith("/tokens"):
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lower() in ("auto", "max", "0"):
+                    sess.max_tokens = sess.prefs["agent_max_tokens"] = 0
+                    print(_dim("  reply length = auto (model window)"))
+                elif len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                    sess.max_tokens = sess.prefs["agent_max_tokens"] = int(parts[1])
+                    print(_dim(f"  reply length = {sess.max_tokens}"))
+                else:
+                    print(_dim("  auto (model window)" if not sess.max_tokens else str(sess.max_tokens)))
+                bar.refresh()
+                continue
+            if line in ("/model", "/switch", "/handoff"):
                 sess.persist()
                 return "switch"
-            continue
-        if line == "/help":
-            print(HELP)
-            continue
-        if line in ("/clear", "/reset", "/new"):
-            sess.persist()
-            sess.history = []
-            sess.pending = None
-            sess.session_id = None
-            print(_dim("  conversation cleared — new session"))
-            continue
-        if line == "/tools":
-            for spec in sess.make_registry().values():
-                src = f"  {_dim(spec.source)}" if spec.source != "builtin" else ""
-                print(f"  {spec.name}{src}")
-            continue
-        if line == "/docs":
-            print(_dim("  aliases → GitHub repos (tool: docs)"))
-            seen = {}
-            for k, v in DOC_ALIASES.items():
-                seen.setdefault(v, []).append(k)
-            for repo, aliases in seen.items():
-                print(f"  {', '.join(aliases):<28} {repo}")
-            print(_dim("  or pass any owner/repo"))
-            continue
-        if line == "/mcp":
-            if sess.hub.servers:
-                for line_s in sess.hub.summary():
-                    print("  " + line_s)
-            else:
-                print(_dim("  no MCP servers. add ~/.lightlx/mcp.json  (see /help)"))
-            continue
-        if line == "/task":
-            print(_dim("  ask the model to use the task tool — several in one turn run in parallel"))
-            print(_dim("  types: explore (read-only) · implement · general"))
-            continue
-        if line.startswith("/workspace"):
-            parts = line.split(maxsplit=1)
-            _set_workspace(sess, parts[1] if len(parts) == 2 else None)
-            continue
-        if line.startswith("/tokens"):
-            parts = line.split()
-            if len(parts) == 2 and parts[1].isdigit():
-                sess.max_tokens = sess.prefs["agent_max_tokens"] = int(parts[1])
-                print(_dim(f"  reply length = {sess.max_tokens}"))
-            else:
-                print(_dim(f"  {sess.max_tokens}"))
-            continue
-        if line in ("/model", "/switch", "/handoff"):
-            sess.persist()
-            return "switch"
-        if line == "/compact":
-            _do_compact(sess)
-            continue
-        if line == "/save":
-            sess.persist()
-            print(_dim(f"  saved {sess.session_id} · {title_from(sess.history)}"))
-            continue
-        if line.startswith("/resume"):
-            rec = _pick_resume()
-            if rec:
-                apply_record(sess, rec)
-                src = rec.get("source") or {}
-                if src.get("kind") and src.get("kind") != getattr(sess.provider, "kind", ""):
-                    print(_dim("  session was on a different backend — /handoff to switch, or continue here"))
-            continue
-        if line == "/skills":
-            if not sess.skills:
-                print(_dim("  no skills. /import Claude or Codex, or add .lightlx/skills/<name>/SKILL.md"))
-            for s in sorted(sess.skills.values(), key=lambda x: x.name):
-                fork = " · fork" if s.fork else ""
-                print(f"  /{s.name:<22} {_dim(s.source + fork)}  {s.description[:70]}")
-            continue
-        if line == "/import":
-            _import_menu(sess)
-            continue
-        if line == "/memory":
-            files = sess.memory.list_files()
-            print(_dim(f"  {sess.memory.dir}"))
-            if files:
-                for name in files:
-                    print(f"  {name}")
-            else:
-                print(_dim("  empty — the agent writes here as it learns, or ask it to remember something"))
-            idx = sess.memory.load_index()
-            if idx:
-                print(_dim("\n  MEMORY.md"))
-                print(idx[:1500])
-            continue
-        if line == "/init":
-            print(_dim("  " + init_project(sess.ws.root)))
-            sess.reload_knowledge()
-            continue
-        if line.startswith("/"):
-            name, _, rest = line[1:].partition(" ")
-            sk = sess.skills.get(name) or sess.skills.get(name.lower())
-            if sk and sk.user_invocable:
-                printer.reset()
-                body = expand_skill(sk, rest, workspace=str(sess.ws.root))
-                if sk.fork:
-                    run_turn(sess, f"Run this skill as a subagent (task tool, type {sk.agent_kind}):\n\n{body}", printer)
-                else:
-                    run_turn(sess, body, printer)
+            if line == "/compact":
+                _do_compact(sess)
+                bar.refresh()
                 continue
-            print(_dim(f"  unknown command {line} — try /help or /skills"))
-            continue
-        printer.reset()
-        run_turn(sess, line, printer)
+            if line == "/save":
+                sess.persist()
+                print(_dim(f"  saved {sess.session_id} · {title_from(sess.history)}"))
+                continue
+            if line.startswith("/resume"):
+                with bar.paused():
+                    rec = _pick_resume()
+                    if rec:
+                        apply_record(sess, rec)
+                        src = rec.get("source") or {}
+                        if src.get("kind") and src.get("kind") != getattr(sess.provider, "kind", ""):
+                            print(_dim("  session was on a different backend — /handoff to switch, or continue here"))
+                bar.attach(sess)
+                bar.refresh()
+                continue
+            if line == "/skills":
+                if not sess.skills:
+                    print(_dim("  no skills. /import Claude or Codex, or add .lightlx/skills/<name>/SKILL.md"))
+                for s in sorted(sess.skills.values(), key=lambda x: x.name):
+                    fork = " · fork" if s.fork else ""
+                    print(f"  /{s.name:<22} {_dim(s.source + fork)}  {s.description[:70]}")
+                continue
+            if line == "/import":
+                with bar.paused():
+                    _import_menu(sess)
+                continue
+            if line == "/memory":
+                files = sess.memory.list_files()
+                print(_dim(f"  {sess.memory.dir}"))
+                if files:
+                    for name in files:
+                        print(f"  {name}")
+                else:
+                    print(_dim("  empty — the agent writes here as it learns, or ask it to remember something"))
+                idx = sess.memory.load_index()
+                if idx:
+                    print(_dim("\n  MEMORY.md"))
+                    print(idx[:1500])
+                continue
+            if line == "/init":
+                print(_dim("  " + init_project(sess.ws.root)))
+                sess.reload_knowledge()
+                continue
+            if line.startswith("/"):
+                name, _, rest = line[1:].partition(" ")
+                sk = sess.skills.get(name) or sess.skills.get(name.lower())
+                if sk and sk.user_invocable:
+                    printer.reset()
+                    body = expand_skill(sk, rest, workspace=str(sess.ws.root))
+                    bar.busy = True
+                    bar.refresh()
+                    if sk.fork and sess.allow_subagents:
+                        run_turn(sess, f"Run this skill as a subagent (task tool, type {sk.agent_kind}):\n\n{body}", on_event)
+                    else:
+                        if sk.fork and not sess.allow_subagents:
+                            print(_dim("  subagents unavailable — running this skill inline"))
+                        run_turn(sess, body, on_event)
+                    bar.busy = False
+                    bar.refresh()
+                    continue
+                print(_dim(f"  unknown command {line} — try /help or /skills"))
+                continue
+            printer.reset()
+            bar.busy = True
+            bar.refresh()
+            run_turn(sess, line, on_event)
+            bar.busy = False
+            bar.refresh()
+    finally:
+        bar.stop()
