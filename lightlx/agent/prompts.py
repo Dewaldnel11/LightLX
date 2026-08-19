@@ -52,7 +52,16 @@ When you need a tool, emit one or more blocks exactly like this (no extra prose 
 <tool_call>
 {{"name": "TOOL_NAME", "arguments": {{"arg": "value"}}}}
 </tool_call>
-You may emit multiple <tool_call> blocks. After tool results arrive, continue until the task is done.
+These formats also work:
+```tool_code
+TOOL_NAME(arg="value")
+```
+<tool_call>
+TOOL_NAME
+<arg_key>arg</arg_key>
+<arg_value>value</arg_value>
+</tool_call>
+Use the exact tool names listed below. You may emit multiple calls. After results arrive, continue until the task is done.
 Only skip tools when you can answer from context you already have.
 Available tools:
 {tool_list}

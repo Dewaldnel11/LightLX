@@ -56,6 +56,32 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(content, "just a reply")
         self.assertEqual(calls, [])
 
+    def test_tool_code_json_fence(self):
+        text = '```tool_code\n{"name": "read_file", "parameters": {"path": "a.py"}}\n```'
+        _, calls = parse_text_tool_calls(text)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments["path"], "a.py")
+
+    def test_tool_code_python(self):
+        text = '```tool_code\nprint(default_api.read_file(path="src/app.py", offset=1))\n```'
+        _, calls = parse_text_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments["path"], "src/app.py")
+        self.assertEqual(calls[0].arguments["offset"], 1)
+
+    def test_function_xml(self):
+        text = '<function=bash>{"command": "ls -la"}</function>'
+        _, calls = parse_text_tool_calls(text)
+        self.assertEqual(calls[0].name, "bash")
+        self.assertEqual(calls[0].arguments["command"], "ls -la")
+
+    def test_invoke_line(self):
+        text = 'invoke tool read_file with path is a.py'
+        _, calls = parse_text_tool_calls(text)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments["path"], "a.py")
+
 
 class StreamAccTests(unittest.TestCase):
     def test_content_and_tools(self):
@@ -71,6 +97,28 @@ class StreamAccTests(unittest.TestCase):
         self.assertEqual(result.content, "Hi")
         self.assertEqual(result.tool_calls[0].name, "read_file")
         self.assertEqual(result.tool_calls[0].arguments["path"], "x")
+
+    def test_nameless_slot_kept(self):
+        acc = StreamAcc()
+        acc.feed({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"arguments": '{"path": "x"}'}}
+        ]}}]})
+        result = acc.result()
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "")
+        self.assertEqual(result.tool_calls[0].arguments["path"], "x")
+
+    def test_dict_args_merge(self):
+        acc = StreamAcc()
+        acc.feed({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": {"path": "a"}}}
+        ]}}]})
+        acc.feed({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": {"offset": 2}}}
+        ]}}]})
+        result = acc.result()
+        self.assertEqual(result.tool_calls[0].arguments["path"], "a")
+        self.assertEqual(result.tool_calls[0].arguments["offset"], 2)
 
 
 class ToolsTests(unittest.TestCase):
@@ -338,6 +386,149 @@ class SkillsMemoryTests(unittest.TestCase):
         again = init_project(root)
         self.assertIn("already exists", again)
         tmp.cleanup()
+
+
+class CompatLoopTests(unittest.TestCase):
+    def test_text_mode_parses_and_runs(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolSpec
+
+        calls = []
+
+        def read_file(path):
+            calls.append(path)
+            return f"contents of {path}"
+
+        registry = {
+            "read_file": ToolSpec(
+                "read_file", "Read",
+                {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                read_file,
+            ),
+        }
+
+        class Fake:
+            parallel_safe = True
+
+            def __init__(self):
+                self.n = 0
+
+            def complete(self, messages, tools=None, **kwargs):
+                self.n += 1
+                if self.n == 1:
+                    return Completion(
+                        '```tool_code\nprint(read_file(path="a.py"))\n```',
+                        [],
+                        "stop",
+                    )
+                return Completion("done", [], "stop")
+
+        result = run_agent(
+            Fake(), [{"role": "user", "content": "read it"}], registry,
+            native_tools=False, max_iters=5,
+        )
+        self.assertEqual(calls, ["a.py"])
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.text, "done")
+
+    def test_alias_and_arg_remap(self):
+        from lightlx.agent.loop import execute_tools
+        from lightlx.agent.types import ToolCall, ToolSpec
+
+        seen = {}
+
+        def bash(command):
+            seen["command"] = command
+            return "ok"
+
+        registry = {
+            "bash": ToolSpec(
+                "bash", "Run",
+                {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+                bash,
+            ),
+        }
+        outs = execute_tools(
+            [ToolCall(id="c1", name="run_terminal_cmd", arguments={"cmd": "ls"})],
+            registry, parallel=False,
+        )
+        self.assertEqual(outs, ["ok"])
+        self.assertEqual(seen["command"], "ls")
+
+    def test_git_snapshot(self):
+        from lightlx.agent.loop import _git_snapshot
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        if os.system(f"git -C {root} init -q") != 0:
+            tmp.cleanup()
+            self.skipTest("git missing")
+        (root / "a.txt").write_text("hi\n")
+        snap = _git_snapshot(str(root))
+        self.assertIsNotNone(snap)
+        status, _ = snap
+        self.assertIn("a.txt", status)
+        tmp.cleanup()
+
+    def test_agent_status_max_iters(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolSpec
+
+        class Looping:
+            parallel_safe = True
+
+            def complete(self, messages, **kwargs):
+                return Completion("", [], "stop")
+
+        registry = {
+            "read_file": ToolSpec("read_file", "r", {"type": "object", "properties": {}}, lambda **k: ""),
+        }
+        result = run_agent(
+            Looping(), [{"role": "user", "content": "x"}], registry,
+            native_tools=False, max_iters=2,
+        )
+        # empty completions with no tools end as done (nudged or not)
+        self.assertIn(result.status, ("done", "max_iters"))
+
+
+class SessionPersistTests(unittest.TestCase):
+    def test_record_from_keeps_task_reports(self):
+        from lightlx.agent.sessions import record_from
+        from lightlx.agent.types import ToolCall
+
+        class FakeSess:
+            session_id = "s1"
+            history = [
+                {"role": "user", "content": "fix auth"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        ToolCall(id="t1", name="task", arguments={"description": "fix", "prompt": "do it"}),
+                        ToolCall(id="t2", name="read_file", arguments={"path": "a.py"}),
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "t1", "name": "task", "content": "subagent [implement] fix — done · 3 steps\nchanged a.py"},
+                {"role": "tool", "tool_call_id": "t2", "name": "read_file", "content": "x" * 200},
+                {"role": "assistant", "content": "all good"},
+            ]
+            pending = None
+            ws = type("W", (), {"root": "/tmp"})()
+            provider = type("P", (), {"label": "lmstudio/gemma", "kind": "lmstudio"})()
+            max_tokens = 4096
+
+        rec = record_from(FakeSess(), {"kind": "lmstudio"})
+        hist = rec["history"]
+        roles = [m["role"] for m in hist]
+        self.assertIn("tool", roles)
+        task = next(m for m in hist if m.get("role") == "tool" and m.get("name") == "task")
+        self.assertIn("subagent", task["content"])
+        read = next(m for m in hist if m.get("role") == "tool" and m.get("name") == "read_file")
+        self.assertEqual(read["content"], "(elided)")
+        orphan_asst = next(
+            m for m in hist
+            if m.get("role") == "assistant" and m.get("content") == "all good"
+        )
+        self.assertFalse(orphan_asst.get("tool_calls"))
 
 
 if __name__ == "__main__":

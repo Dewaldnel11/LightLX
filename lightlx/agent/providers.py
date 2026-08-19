@@ -183,11 +183,12 @@ def parse_args(raw):
 def _tool_calls_from_openai(message):
     out = []
     for tc in message.get("tool_calls") or []:
-        fn = tc.get("function") or {}
-        args = fn.get("arguments")
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        args = fn.get("arguments") if isinstance(fn, dict) else None
+        name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
         out.append(ToolCall(
             id=tc.get("id") or ("call_" + uuid.uuid4().hex[:12]),
-            name=fn.get("name") or "",
+            name=name or "",
             arguments=parse_args(args),
             raw_arguments=args if isinstance(args, str) else json.dumps(args or {}),
         ))
@@ -239,7 +240,10 @@ class StreamAcc:
         calls = []
         for i in sorted(self.tools):
             slot = self.tools[i]
-            if not slot["name"]:
+            # Keep nameless slots that carry arguments: dropping them silently
+            # turns a malformed stream into an empty completion; an empty name
+            # surfaces as a visible "unknown tool" error the model can retry.
+            if not slot["name"] and not (slot["arguments"] or "").strip():
                 continue
             calls.append(ToolCall(
                 id=slot["id"] or f"call_{i}_{uuid.uuid4().hex[:8]}",
@@ -264,6 +268,7 @@ class OpenAICompat:
         self.timeout = timeout
         self.label = model
         self.context_length = 0
+        self.frequency_penalty = 0.4
 
     def complete(self, messages, tools=None, max_tokens=4096, temperature=0.2, on_text=None):
         from .context import sanitize_messages
@@ -273,28 +278,43 @@ class OpenAICompat:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "frequency_penalty": 0.4,
             "stream": True,
         }
+        if self.frequency_penalty is not None:
+            body["frequency_penalty"] = self.frequency_penalty
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
         url = self.base_url + "/v1/chat/completions"
+
+        def send(payload):
+            try:
+                return self._stream(url, payload, on_text)
+            except RuntimeError as e:
+                if "404" not in str(e) and "stream" not in str(e).lower():
+                    raise
+                payload = dict(payload)
+                payload["stream"] = False
+                data, _ = http_json("POST", url, payload, _headers(self.api_key), timeout=self.timeout or 600)
+                choice = (data.get("choices") or [{}])[0]
+                msg = choice.get("message") or {}
+                content = message_text(msg.get("content")) or message_text(
+                    msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thinking")
+                )
+                if on_text and content:
+                    on_text(content)
+                calls = _tool_calls_from_openai(msg)
+                finish = choice.get("finish_reason") or "stop"
+                return Completion(content, calls, "tool_calls" if calls else finish)
+
         try:
-            return self._stream(url, body, on_text)
+            return send(body)
         except RuntimeError as e:
-            if "404" not in str(e) and "stream" not in str(e).lower():
-                raise
-            body["stream"] = False
-            data, _ = http_json("POST", url, body, _headers(self.api_key), timeout=self.timeout or 600)
-            msg = ((data.get("choices") or [{}])[0].get("message")) or {}
-            content = message_text(msg.get("content")) or message_text(
-                msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thinking")
-            )
-            if on_text and content:
-                on_text(content)
-            calls = _tool_calls_from_openai(msg)
-            return Completion(content, calls, "tool_calls" if calls else "stop")
+            if str(e).lstrip().startswith("400") and "frequency_penalty" in body:
+                body = dict(body)
+                body.pop("frequency_penalty", None)
+                return send(body)
+            raise
 
     def _stream(self, url, body, on_text):
         req = urllib.request.Request(
@@ -383,15 +403,16 @@ class Ollama(OpenAICompat):
                         if on_text:
                             on_text(piece)
                     for tc in msg.get("tool_calls") or []:
-                        fn = tc.get("function") or {}
-                        args = fn.get("arguments")
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                        args = fn.get("arguments") if isinstance(fn, dict) else None
+                        name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
                         if isinstance(args, str):
                             parsed, raw_a = parse_args(args), args
                         else:
                             parsed, raw_a = (args or {}), json.dumps(args or {})
                         calls.append(ToolCall(
                             id=tc.get("id") or ("call_" + uuid.uuid4().hex[:12]),
-                            name=fn.get("name") or "",
+                            name=name or "",
                             arguments=parsed,
                             raw_arguments=raw_a,
                         ))
@@ -410,6 +431,7 @@ class LMStudio(OpenAICompat):
     def __init__(self, model, base_url=None, api_key=None, timeout=None):
         super().__init__(base_url or DEFAULT_LMSTUDIO, model, api_key=api_key or "lm-studio", timeout=timeout)
         self.label = f"lmstudio/{model}"
+        self.frequency_penalty = None
 
 
 class CustomOpenAI(OpenAICompat):

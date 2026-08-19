@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import uuid
@@ -5,12 +6,27 @@ import uuid
 from .types import ToolCall
 
 _BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
-_FENCE = re.compile(r"```(?:tool_call|json)\s*(\{.*?\})\s*```", re.DOTALL)
+_FENCE = re.compile(r"```(?:tool_call|tool_code|json)\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _QWEN = re.compile(
     r"<tool_call>\s*([A-Za-z0-9_\-\.]+)\s*(.*?)</tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
 _ARG = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>", re.DOTALL)
+_FUNC_XML = re.compile(
+    r"<function\s*[=:]\s*([A-Za-z0-9_\-\.]+)\s*>(.*?)</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+_INVOKE = re.compile(
+    r"invoke\s+(?:tool\s+)?([A-Za-z0-9_\-\.]+)\s+with\s+(.+)",
+    re.IGNORECASE,
+)
+_KV = re.compile(r"([A-Za-z_][\w]*)\s*(?:=|:|is)\s*(\"[^\"]*\"|'[^']*'|[^\s,]+)", re.I)
+_PY_SKIP = {
+    "print", "len", "range", "str", "int", "float", "list", "dict", "set", "tuple",
+    "open", "format", "type", "min", "max", "sum", "sorted", "enumerate", "zip",
+    "map", "filter", "bool", "repr", "abs", "round", "any", "all", "super",
+    "isinstance", "hasattr", "getattr", "setattr", "callable", "iter", "next",
+}
 
 
 def _args(raw):
@@ -27,12 +43,115 @@ def _args(raw):
 
 
 def _call(name, arguments, raw=""):
+    name = (name or "").strip()
+    if "." in name:
+        name = name.rsplit(".", 1)[-1]
     return ToolCall(
         id="call_" + uuid.uuid4().hex[:12],
-        name=(name or "").strip(),
+        name=name,
         arguments=_args(arguments),
         raw_arguments=raw if isinstance(raw, str) else json.dumps(arguments or {}),
     )
+
+
+def _from_mapping(data, raw=""):
+    if isinstance(data, list):
+        out = []
+        for item in data:
+            out.extend(_from_mapping(item, raw))
+        return out
+    if not isinstance(data, dict):
+        return []
+    name = data.get("name") or data.get("tool") or data.get("function")
+    if isinstance(name, dict):
+        name = name.get("name")
+    if not name:
+        return []
+    args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
+    return [_call(name, args, raw or json.dumps(data))]
+
+
+def _py_kwargs(raw):
+    raw = (raw or "").strip().rstrip(",")
+    if not raw:
+        return {}
+    try:
+        tree = ast.parse(f"f({raw})", mode="eval")
+    except SyntaxError:
+        return {}
+    if not isinstance(tree.body, ast.Call):
+        return {}
+    out = {}
+    for kw in tree.body.keywords:
+        if not kw.arg:
+            continue
+        try:
+            out[kw.arg] = ast.literal_eval(kw.value)
+        except Exception:
+            out[kw.arg] = ast.unparse(kw.value) if hasattr(ast, "unparse") else ""
+    return out
+
+
+def _split_call_args(text, open_idx):
+    depth = 0
+    quote = None
+    escape = False
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in ('"', "'"):
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i], i + 1
+    return None, None
+
+
+def extract_python_tool_calls(text):
+    calls, used = [], []
+    i = 0
+    ident = re.compile(r"[A-Za-z_][\w\.]*")
+    while i < len(text):
+        m = ident.search(text, i)
+        if not m:
+            break
+        name = m.group(0)
+        j = m.end()
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != "(":
+            i = m.end()
+            continue
+        args_s, end = _split_call_args(text, j)
+        if args_s is None:
+            break
+        base = name.rsplit(".", 1)[-1]
+        if base.lower() in _PY_SKIP:
+            i = j + 1
+            continue
+        kwargs = _py_kwargs(args_s)
+        if kwargs or args_s.strip() == "":
+            calls.append(_call(base, kwargs, args_s))
+            used.append((m.start(), end))
+        i = end
+    return calls, used
+
+
+def _invoke_args(blob):
+    out = {}
+    for k, v in _KV.findall(blob or ""):
+        out[k] = v.strip().strip("\"'")
+    return out
 
 
 _NARRATE = re.compile(
@@ -98,10 +217,9 @@ def parse_text_tool_calls(text: str):
                 data = json.loads(body)
             except json.JSONDecodeError:
                 data = None
-            if isinstance(data, dict) and (data.get("name") or data.get("tool")):
-                name = data.get("name") or data.get("tool")
-                args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
-                calls.append(_call(name, args, body))
+            found = _from_mapping(data, body) if data is not None else []
+            if found:
+                calls.extend(found)
                 used.append(m.span())
                 continue
         qm = _QWEN.match(m.group(0))
@@ -112,17 +230,37 @@ def parse_text_tool_calls(text: str):
                 calls.append(_call(name, args, qm.group(2)))
                 used.append(m.span())
 
+    for m in _FUNC_XML.finditer(text):
+        raw = m.group(2).strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            data = _invoke_args(raw)
+        if isinstance(data, dict):
+            calls.append(_call(m.group(1), data, raw))
+            used.append(m.span())
+
     if not calls:
         for m in _FENCE.finditer(text):
+            body = (m.group(1) or "").strip()
             try:
-                data = json.loads(m.group(1))
+                data = json.loads(body)
             except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict) and (data.get("name") or data.get("tool")):
-                name = data.get("name") or data.get("tool")
-                args = data.get("arguments") or data.get("parameters") or {}
-                calls.append(_call(name, args, m.group(1)))
+                data = None
+            found = _from_mapping(data, body) if data is not None else []
+            if found:
+                calls.extend(found)
                 used.append(m.span())
+                continue
+            py, _ = extract_python_tool_calls(body)
+            if py:
+                calls.extend(py)
+                used.append(m.span())
+
+    if not calls:
+        for m in _INVOKE.finditer(text):
+            calls.append(_call(m.group(1), _invoke_args(m.group(2)), m.group(2)))
+            used.append(m.span())
 
     if not used:
         return text.strip(), calls

@@ -167,10 +167,8 @@ everything else. Subagents cannot nest.
 ```
   → task  map the auth flow
   → task  find flaky tests
-    ▸ subagent explore · map the auth flow
-      → grep  login
-      ✓ grep  login
-    ✓ subagent explore · map the auth flow
+    ✓ subagent: map the auth flow (12 steps, 45s)
+    ✗ subagent: find flaky tests — timed out (17 steps, 10m)
 ```
 
 Docs aliases: `claude-code`, `codex`, `ollama`, `lmstudio`, `mcp`, `lightlx` —

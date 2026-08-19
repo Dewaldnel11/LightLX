@@ -3,7 +3,7 @@ import sys
 import time
 
 from .context import detect_context, estimate_tokens, handoff_note, maybe_compact
-from .loop import SubagentLauncher, run_agent, seed_messages
+from .loop import SubagentLauncher, _fmt_dur, _git_snapshot, run_agent, seed_messages
 from .mcp import MCPHub, load_mcp_config
 from .memory import format_instructions, init_project, load_instructions
 from .memory import MemoryStore
@@ -141,19 +141,23 @@ def make_printer():
     read_group = {"active": False, "names": []}
     subagent_stack = {}
 
-    def on_event(kind, text="", name="", detail="", depth=0, ok=True, **_):
+    def on_event(kind, text="", name="", detail="", depth=0, ok=True, **kw):
         pad = "  " + ("  " * depth)
+        key = kw.get("key") or name
         if kind == "text":
             if not started["n"]:
                 print()
                 started["n"] = True
-            sys.stdout.write(text)
+            chunk = text
+            if depth >= 1:
+                chunk = _dim(text)
+            sys.stdout.write(chunk)
             sys.stdout.flush()
         elif kind == "tool_start":
             if started["n"]:
                 print()
                 started["n"] = False
-            tool_stack[name] = {"detail": detail or name, "t0": time.time()}
+            tool_stack[key] = {"detail": detail or name, "t0": time.time(), "name": name}
             if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
                 read_group["active"] = True
                 read_group["names"].append(detail or name)
@@ -164,11 +168,12 @@ def make_printer():
             if started["n"]:
                 print()
                 started["n"] = False
-            info = tool_stack.pop(name, {})
+            info = tool_stack.pop(key, {})
             dur = time.time() - info.get("t0", time.time())
             mark = _ok("✓") if ok else _err("✗")
             tail = f" {_dim(f'{dur:.1f}s')}" if dur > 0.2 else ""
-            if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
+            shown = info.get("name") or name
+            if shown in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
                 read_group["names"] = [n for n in read_group["names"] if n != (detail or name)]
                 if not read_group["names"]:
                     read_group["active"] = False
@@ -182,17 +187,33 @@ def make_printer():
             if started["n"]:
                 print()
                 started["n"] = False
-            subagent_stack[name] = detail
-            # don't print start - wait for end to show one compact line
+            subagent_stack[key] = detail
         elif kind == "subagent_end":
             if started["n"]:
                 print()
                 started["n"] = False
-            detail = subagent_stack.pop(name, detail)
+            detail = subagent_stack.pop(key, detail)
             mark = _ok("✓") if ok else _err("✗")
-            # one compact line for the whole subagent
             short = detail[:60] + ("…" if len(detail) > 60 else "")
-            print(_dim(f"{pad}{mark} subagent: {short}"))
+            status = kw.get("status") or ""
+            steps = kw.get("steps")
+            dur = kw.get("dur")
+            extra = ""
+            if status and status != "done":
+                extra = f" — {status.replace('_', ' ')}"
+                bits = []
+                if steps:
+                    bits.append(f"{steps} steps")
+                if dur is not None:
+                    bits.append(_fmt_dur(dur))
+                if bits:
+                    extra += f" ({', '.join(bits)})"
+            elif steps:
+                extra = f" ({steps} steps"
+                if dur is not None:
+                    extra += f", {_fmt_dur(dur)}"
+                extra += ")"
+            print(_dim(f"{pad}{mark} subagent: {short}{extra}"))
         elif kind == "compact":
             if started["n"]:
                 print()
@@ -251,9 +272,40 @@ def _bind_events(sess, on_event):
     return make_registry
 
 
+def _tools_http_rejected(err):
+    msg = str(err).lstrip()
+    return msg.startswith("400")
+
+
 def _finish_turn(sess, result):
     sess.pending = None
     sess.history = [m for m in (result.messages or []) if m.get("role") != "system"]
+    if sess.native_tools:
+        used = any(m.get("role") == "tool" for m in result.messages or [])
+        if used:
+            sess._idle_native = 0
+        else:
+            sess._idle_native = getattr(sess, "_idle_native", 0) + 1
+            if sess._idle_native >= 2:
+                sess.native_tools = False
+                print(_dim("  no tool calls in native mode — switching to text tool-call mode"))
+    write_tools = {"write_file", "edit_file", "bash"}
+    wrote = False
+    for m in result.messages or []:
+        for tc in m.get("tool_calls") or []:
+            name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else "")
+            if name in write_tools:
+                wrote = True
+                break
+        if wrote:
+            break
+    if wrote:
+        snap = _git_snapshot(str(sess.ws.root))
+        if snap and snap[0]:
+            line = snap[0].replace("\n", ", ")
+            if len(line) > 120:
+                line = line[:117] + "…"
+            print(_dim(f"  changed: {line}"))
     sess.persist()
 
 
@@ -278,6 +330,10 @@ def resume_pending(sess, on_event):
         print(_dim("\n— stopped — checkpoint saved. resume next launch."))
         return
     except Exception as e:
+        if sess.native_tools and _tools_http_rejected(e):
+            sess.native_tools = False
+            print(_dim("  model rejected the tools parameter — switching to text tool-call mode"))
+            return resume_pending(sess, on_event)
         print(_dim(f"\n  {e}"))
         return
     _finish_turn(sess, result)
@@ -307,6 +363,13 @@ def run_turn(sess, user_text, on_event):
         print(_dim("\n— stopped — checkpoint saved. pick Resume next time."))
         return
     except Exception as e:
+        if sess.native_tools and _tools_http_rejected(e):
+            if sess.history and sess.history[-1].get("role") == "user":
+                sess.history.pop()
+            sess.pending = None
+            sess.native_tools = False
+            print(_dim("  model rejected the tools parameter — switching to text tool-call mode"))
+            return run_turn(sess, user_text, on_event)
         print(_dim(f"\n  {e}"))
         sess.history.pop()
         sess.pending = None

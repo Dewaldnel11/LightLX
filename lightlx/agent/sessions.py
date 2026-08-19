@@ -132,8 +132,68 @@ def title_from(history) -> str:
     return "untitled"
 
 
+def _call_name(tc):
+    if hasattr(tc, "name"):
+        return tc.name or ""
+    if isinstance(tc, dict):
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        return (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
+    return ""
+
+
+def _call_id(tc):
+    if hasattr(tc, "id"):
+        return tc.id or ""
+    if isinstance(tc, dict):
+        return tc.get("id") or ""
+    return ""
+
+
+def history_for_save(messages):
+    msgs = list(messages or [])
+    out = []
+    i = 0
+    while i < len(msgs):
+        m = msgs[i]
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            calls = m["tool_calls"]
+            names = {_call_name(tc) for tc in calls}
+            keep = "task" in names
+            results, j = [], i + 1
+            while j < len(msgs) and msgs[j].get("role") == "tool":
+                results.append(msgs[j])
+                j += 1
+            if keep:
+                out.append(m)
+                for r in results:
+                    rr = dict(r)
+                    is_task = rr.get("name") == "task" or rr.get("tool_call_id") in {
+                        _call_id(tc) for tc in calls if _call_name(tc) == "task"
+                    }
+                    content = str(rr.get("content") or "")
+                    if is_task:
+                        if len(content) > 4000:
+                            rr["content"] = content[:4000] + "\n… truncated"
+                    elif len(content) > 120:
+                        rr["content"] = "(elided)"
+                    out.append(rr)
+            else:
+                stripped = dict(m)
+                stripped.pop("tool_calls", None)
+                out.append(stripped)
+            i = j
+            continue
+        if role in ("user", "assistant", "system"):
+            out.append(m)
+        i += 1
+    return out
+
+
 def record_from(sess, source=None):
-    hist = [m for m in (sess.history or []) if m.get("role") in ("user", "assistant", "system")]
+    hist = history_for_save(
+        [m for m in (sess.history or []) if m.get("role") in ("user", "assistant", "system", "tool")]
+    )
     src = source or getattr(sess, "source", None) or {}
     pending = getattr(sess, "pending", None)
     return {
