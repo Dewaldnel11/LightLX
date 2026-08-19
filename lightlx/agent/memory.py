@@ -135,7 +135,12 @@ def _walk_dirs(workspace: Path):
     return chain
 
 
-def load_instructions(workspace) -> list[tuple[str, str]]:
+def rule_applies(meta, touched_paths=None) -> bool:
+    from .brain import rule_matches_paths
+    return rule_matches_paths(meta, touched_paths)
+
+
+def load_instructions(workspace, touched_paths=None) -> list[tuple[str, str]]:
     ws = Path(workspace).resolve()
     out = []
     seen = set()
@@ -166,8 +171,7 @@ def load_instructions(workspace) -> list[tuple[str, str]]:
                 continue
             for p in sorted(d.rglob("*.md")):
                 meta, body = split_frontmatter(_read(p))
-                paths = meta.get("paths")
-                if paths:
+                if not rule_applies(meta, touched_paths):
                     continue
                 if body.strip():
                     add(f"rules/{p.name}", p)

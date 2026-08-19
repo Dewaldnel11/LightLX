@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 from .prompts import DOC_ALIASES
@@ -141,7 +141,15 @@ class BuiltinTools:
                 },
                 "required": ["url"],
             }, self.fetch_url),
-            self._spec("skill", "Load a Claude/Codex/LightLX skill. Skills marked context:fork run as a subagent. Several skill/task calls in one turn run in parallel.", {
+            self._spec("web_search", "Search the public web (DuckDuckGo). Use before fetch_url. Several searches in one turn run in parallel.", {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["query"],
+            }, self.web_search),
+            self._spec("skill", "Load a Claude/Codex/LightLX skill. Skills marked context:fork run as a subagent. On LM Studio, do not fork several skills in one turn.", {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
@@ -159,6 +167,27 @@ class BuiltinTools:
                 },
                 "required": ["action"],
             }, self.memory_tool),
+            self._spec("brain_search", "Search the cross-project brain and all project memory files.", {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "kind": {"type": "string", "description": "preference, correction, gotcha, workflow, project"},
+                    "scope": {"type": "string"},
+                },
+                "required": ["query"],
+            }, self.brain_search_tool),
+            self._spec("brain_write", "Write a typed cross-project brain record. Web facts need url. Do not store secrets or unverified claims.", {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["preference", "correction", "gotcha", "workflow", "project"]},
+                    "text": {"type": "string"},
+                    "scope": {"type": "string"},
+                    "source": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "url": {"type": "string", "description": "Primary source URL for web-grounded facts"},
+                },
+                "required": ["kind", "text"],
+            }, self.brain_write_tool),
             self._spec("docs", "Read docs/source from Claude Code, Codex, Ollama, MCP, or any GitHub repo.", {
                 "type": "object",
                 "properties": {
@@ -206,8 +235,9 @@ class BuiltinTools:
         if include_task and self.launch_task:
             out.append(self._spec(
                 "task",
-                "Launch a subagent for a big or long-horizon job. Several task calls in the SAME turn run in PARALLEL — "
-                "for a large task, issue multiple task calls together (one per area) instead of one big one. "
+                "Launch a subagent for a big or long-horizon job. On LM Studio / a single local "
+                "GPU, issue ONE task at a time — parallel task calls drop the parent stream. "
+                "On backends that allow it, several task calls in the SAME turn run in parallel. "
                 "explore = read-only research; implement = can edit files; general = full tools. "
                 "Subagents cannot spawn further subagents. Tell them exactly what to return.",
                 {
@@ -378,6 +408,42 @@ class BuiltinTools:
             text = html_to_text(text)
         return _clip(f"url: {final}\n\n{text}", int(max_chars or 20000))
 
+    def web_search(self, query, max_results=8):
+        from .brain import parse_ddg_html
+        q = (query or "").strip()
+        if not q:
+            return "error: query required"
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(q)
+        try:
+            data, ctype, final = http_get(url, timeout=20)
+        except Exception as e:
+            return f"error: {e}"
+        html = data.decode("utf-8", "replace")
+        rows = parse_ddg_html(html)[: int(max_results or 8)]
+        if not rows:
+            text = html_to_text(html)[:4000]
+            return _clip(f"url: {final}\n(no structured results)\n{text}")
+        lines = [f"url: {final}", f"query: {q}", ""]
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{i}. {r['title']}\n   {r['url']}")
+        return "\n".join(lines)
+
+    def brain_search_tool(self, query, kind="", scope=""):
+        from .brain import brain_search
+        return brain_search(query, kind=kind or "", scope=scope or "")
+
+    def brain_write_tool(self, kind, text, scope="global", source="user", confidence="high", url=""):
+        from .brain import write_record
+        if url and not str(url).startswith("http"):
+            return "error: url must be http(s) — unverified claims are not stored"
+        conf = confidence or "high"
+        if not url and conf != "high":
+            return "error: web/idle facts need a source url or confidence=high from the user"
+        return write_record(
+            kind, text, scope=scope or "global", source=source or "user",
+            confidence=conf, url=url or "",
+        )
+
     def docs(self, source, path=None, ref=None, list=False):
         repo = DOC_ALIASES.get((source or "").strip().lower(), source.strip())
         if "/" not in repo:
@@ -456,13 +522,25 @@ class BuiltinTools:
         return "error: action must be read, write, or list"
 
 
+def _short_label(text, n=40):
+    s = str(text or "").strip()
+    if "  " in s:
+        s = s.split("  ", 1)[-1]
+    name = Path(s).name
+    if name and len(name) < len(s):
+        s = name
+    if len(s) <= n:
+        return s
+    return "…" + s[-(n - 1):]
+
+
 def summarize_call(name, args):
     if not isinstance(args, dict):
         return name
-    for key in ("path", "command", "pattern", "url", "source", "description", "workdir"):
-        if args.get(key):
-            val = str(args[key])
-            if len(val) > 80:
-                val = val[:77] + "…"
-            return f"{name}  {val}"
+    junk = {"null", "none", "undefined", "{}", "nil", "n/a", "()"}
+    for key in ("path", "command", "pattern", "url", "source", "description", "workdir", "query"):
+        val = args.get(key)
+        if val is not None and str(val).strip() and str(val).strip().lower() not in junk:
+            sval = _short_label(val, 48)
+            return f"{name}  {sval}"
     return name

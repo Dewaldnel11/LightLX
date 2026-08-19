@@ -1,8 +1,10 @@
 # LightLX — Design Notes
 
 How LightLX runs models that don't fit in RAM, why it's built the way it is, and
-what we measured along the way. Everything here is from runs on a **MacBook Pro
-M4 Pro, 24 GB** unified memory.
+what we measured along the way. Everything in the streaming sections is from runs
+on a **MacBook Pro M4 Pro, 24 GB** unified memory. The last section describes the
+**local coding agent** (LM Studio / Ollama): single-slot GPUs, kickoff
+approve/deny, and why the default prompt is not a sticky footer.
 
 ---
 
@@ -167,3 +169,62 @@ outside the box:
 - GLM-5.2: context ≤ 2048 (the DSA sparse-attention indexer is bypassed — exact
   below `index_topk = 2048`); greedy decoding.
 - Requires the model as safetensors with a `config.json`, fitting on disk.
+
+---
+
+## Local coding agent (Ollama / LM Studio / OpenAI-compat)
+
+The agent is a REPL over the same `lightlx` entrypoint. It is **not** a second
+product: pick a running server at startup, set a workspace folder, and tools
+run against that tree.
+
+### Single-slot local GPUs
+
+LM Studio serves **one** loaded model. Overlapping `/v1/chat/completions`
+streams (several `task` subagents in one turn) make the server log
+`Client disconnected. Stopping generation...`. The parent turn then ends with
+no `[DONE]` and no text — which used to look like a successful empty reply.
+
+LightLX therefore:
+
+- sets `parallel_safe = False` on LM Studio (and MLX), so tools/`task` run
+  **one at a time**;
+- treats a stream that ends without `[DONE]` as `disconnected`;
+- retries **once** on an empty completion, then status `empty` with a visible
+  line (“model returned nothing”);
+- streams answer tokens into the chat as they arrive;
+- does not abort the HTTP connection because Qwen-style **reasoning** tokens
+  repeat (“wait/hmm”) — only repeating **answer** text trips the loop detector.
+
+Kickoff maps the repo with `list_dir` / `glob` / `read_file` in the parent
+turn (or a single `task`, not a fan-out).
+
+### Plan gate
+
+`/kickoff <goal>` is **plan only**. After a non-empty plan:
+
+- `/approve` — implement that plan in a new turn;
+- `/deny` — drop it.
+
+There is no silent “looks done” with nothing to accept.
+
+### Terminal UI
+
+Default input is a normal `›` prompt so replies cannot be painted onto a
+sticky footer and wiped. Set `LIGHTLX_STICKY_BAR=1` to try the two-row footer
+(context meter). DECSTBM + cursor-save is unreliable across macOS Terminal
+profiles; the grey block covering the whole window was that path failing.
+
+### Brain
+
+`~/.lightlx/brain/` holds a tiny `DIGEST.md` plus grep-able records.
+Idle extract is **off** until `/brain on`. `/brain` with no args prints status.
+
+### Completion loop
+
+After a no-tool reply on an **implementation** turn (`/approve`, or a user
+message like “write/fix/implement…”), the harness audits the transcript. If
+the model only narrated, dumped a file in chat, or searched without
+`write_file`/`edit_file`, LightLX injects a sequential check-in (up to 6)
+instead of returning to `›`. `/kickoff` and questions skip this. After 6
+failed check-ins the status is `incomplete`, not `done`.

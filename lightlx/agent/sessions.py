@@ -270,3 +270,21 @@ def age(updated):
     if sec < 86400:
         return f"{sec // 3600}h ago"
     return f"{sec // 86400}d ago"
+
+
+def idle_session_paths(idle_seconds, now=None, sess_dir=None):
+    now = now if now is not None else time.time()
+    folder = sess_dir or SESS_DIR
+    if not os.path.isdir(folder):
+        return []
+    out = []
+    for name in os.listdir(folder):
+        if not name.endswith(".json"):
+            continue
+        p = os.path.join(folder, name)
+        try:
+            if now - os.path.getmtime(p) >= int(idle_seconds or 900):
+                out.append(p)
+        except Exception:
+            continue
+    return out

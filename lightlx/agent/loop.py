@@ -1,3 +1,4 @@
+import re
 import subprocess
 import time
 import traceback
@@ -5,7 +6,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .context import completion_tokens, maybe_compact
-from .parse import looks_like_tool_narration, parse_text_tool_calls
+from .parse import (
+    StreamGate,
+    _norm_path,
+    completion_text_signals,
+    is_implementation_request,
+    looks_like_tool_narration,
+    parse_text_tool_calls,
+)
 from .prompts import format_tool_list, system_prompt
 from .providers import to_openai_messages
 from .tools import summarize_call
@@ -13,6 +21,112 @@ from .types import ToolCall
 
 MAX_ITERS = 80
 MAX_DEPTH = 1
+MAX_COMPLETION_CHECKINS = 6
+
+_EDIT_TOOLS = {"write_file", "edit_file"}
+_SEARCH_TOOLS = {
+    "read_file", "list_dir", "glob", "grep", "fetch_url", "docs",
+    "web_search", "brain_search",
+}
+_HARNESS_USER = (
+    "STOP NARRATING",
+    "READ BUDGET EXCEEDED",
+    "Your previous reply was empty",
+    "Your tool call(s) had empty",
+    "Your reply was cut off",
+    "[LightLX completion check-in",
+)
+
+
+def _msg_text(m):
+    c = (m or {}).get("content")
+    return c if isinstance(c, str) else ""
+
+
+def _tool_name(tc):
+    if hasattr(tc, "name"):
+        return canonical_tool_name(tc.name or "")
+    if isinstance(tc, dict):
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        return canonical_tool_name(
+            (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or ""
+        )
+    return ""
+
+
+def _tool_path(tc):
+    args = getattr(tc, "arguments", None)
+    if args is None and isinstance(tc, dict):
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        args = (fn.get("arguments") if isinstance(fn, dict) else None) or tc.get("arguments")
+    if not isinstance(args, dict):
+        return ""
+    return str(args.get("path") or "")
+
+
+def _goal_text(messages):
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        c = _msg_text(m).strip()
+        if not c or any(c.startswith(p) for p in _HARNESS_USER):
+            continue
+        return c
+    return ""
+
+
+def _wrote_paths(messages):
+    out = set()
+    for m in messages or []:
+        for tc in m.get("tool_calls") or []:
+            if _tool_name(tc) in _EDIT_TOOLS:
+                p = _tool_path(tc)
+                if p:
+                    out.add(_norm_path(p))
+    return out
+
+
+def _tool_names_used(messages):
+    names = []
+    for m in messages or []:
+        if m.get("role") == "tool" and m.get("name"):
+            names.append(canonical_tool_name(m.get("name")))
+        for tc in m.get("tool_calls") or []:
+            n = _tool_name(tc)
+            if n:
+                names.append(n)
+    return names
+
+
+def completion_check_required(messages, user_goal, last_text, *, implementation_mode):
+    if not implementation_mode:
+        return None
+    last = (last_text or "").strip()
+    if not last:
+        return None
+    goal = (user_goal or "").strip()
+    if re.search(r"^(stop|cancel|abort|never mind)\b", goal, re.I):
+        return None
+    sig = completion_text_signals(last)
+    wrote = _wrote_paths(messages)
+    names = _tool_names_used(messages)
+    edits = [n for n in names if n in _EDIT_TOOLS]
+    searches = [n for n in names if n in _SEARCH_TOOLS]
+    if not edits:
+        return "no write_file/edit_file yet — the files are still not in the workspace"
+    if sig["action_promise"]:
+        return "you described the next edit instead of calling the tool"
+    if sig["unapplied_code"]:
+        return "you pasted file contents in chat instead of write_file"
+    missing = []
+    for p in sig["announced_paths"]:
+        if not any(p == w or w.endswith(p) or p.endswith(w) for w in wrote):
+            missing.append(p)
+    if missing:
+        return "announced files not written: " + ", ".join(sorted(missing)[:4])
+    if sig["done_claim"] and searches and not edits:
+        return "you claimed done after only reading/searching"
+    return None
 
 
 class AgentResult:
@@ -75,6 +189,9 @@ TOOL_ALIASES = {
     "web_fetch": "fetch_url",
     "webfetch": "fetch_url",
     "fetch": "fetch_url",
+    "websearch": "web_search",
+    "internet_search": "web_search",
+    "search_web": "web_search",
 }
 
 ARG_ALIASES = {
@@ -84,6 +201,7 @@ ARG_ALIASES = {
     "new_string": ("new_string", "new_str", "new", "replace", "replacement"),
     "content": ("content", "text", "body", "contents", "data"),
     "pattern": ("pattern", "query", "regex"),
+    "query": ("query", "q", "search_term"),
     "description": ("description", "title", "label"),
     "prompt": ("prompt", "instructions", "message"),
     "subagent_type": ("subagent_type", "type", "agent_type", "kind"),
@@ -113,15 +231,29 @@ def _lookup(registry, name):
 def remap_args(spec, args):
     args = dict(args or {})
     props = (spec.parameters or {}).get("properties") or {}
+    _junk_vals = {"null", "none", "undefined", "{}", "nil", "n/a", "()"}
     for canon, alts in ARG_ALIASES.items():
         if canon not in props:
             continue
-        if args.get(canon) not in (None, ""):
+        val = args.get(canon)
+        if isinstance(val, str) and val.strip().lower() in _junk_vals:
+            args.pop(canon, None)
+            val = None
+        if val not in (None, ""):
             continue
         for a in alts:
             if a != canon and args.get(a) not in (None, ""):
-                args[canon] = args[a]
+                aval = args[a]
+                if isinstance(aval, str) and aval.strip().lower() in _junk_vals:
+                    continue
+                args[canon] = aval
                 break
+    for k in list(args.keys()):
+        v = args[k]
+        if isinstance(v, str) and v.strip().lower() in _junk_vals:
+            args.pop(k, None)
+        elif v is None:
+            args.pop(k, None)
     return args
 
 
@@ -231,6 +363,7 @@ def run_agent(
     context_length=None,
     deadline=None,
     on_checkpoint=None,
+    completion_mode="auto",
 ):
     tools = [s.openai_tool() for s in registry.values()] if native_tools else None
     last = ""
@@ -238,8 +371,9 @@ def run_agent(
     nudged = False
     narrate_nudges = 0
     length_nudges = 0
+    checkins = 0
     ctx = context_length or getattr(provider, "context_length", None)
-    read_tools = {"read_file", "list_dir", "glob", "grep", "fetch_url", "docs"}
+    read_tools = {"read_file", "list_dir", "glob", "grep", "fetch_url", "docs", "web_search", "brain_search"}
     write_tools = {"write_file", "edit_file", "bash"}
     reads_since_write = 0
     READ_BUDGET = 6
@@ -276,10 +410,29 @@ def run_agent(
         try:
             payload = to_openai_messages(messages) if native_tools else messages
             n_out = completion_tokens(payload, ctx, max_tokens)
+            streamed = []
+
+            def _emit_text(chunk):
+                if chunk and on_event:
+                    on_event("text", text=chunk, depth=depth)
+
+            def _on_suppress():
+                if on_event:
+                    on_event("tool_stream", depth=depth)
+
+            gate = StreamGate(_emit_text, _on_suppress)
+
+            def on_piece(piece):
+                if not piece:
+                    return
+                streamed.append(piece)
+                gate.feed(piece)
+
             comp = provider.complete(
                 payload, tools=tools, max_tokens=n_out,
-                temperature=temperature, on_text=None,
+                temperature=temperature, on_text=on_piece,
             )
+            gate.close()
         except Exception as e:
             if on_event:
                 on_event("error", text=str(e), depth=depth)
@@ -290,6 +443,11 @@ def run_agent(
             if extra_calls:
                 comp.content = extra_content
                 comp.tool_calls = extra_calls
+
+        # If we hid narrated text but never resolved a real call, surface the
+        # content so nothing is silently swallowed.
+        if gate.suppressed and not comp.tool_calls and comp.content and on_event:
+            on_event("text", text=comp.content, depth=depth)
 
         if comp.tool_calls:
             normalize_calls(comp.tool_calls, registry)
@@ -309,6 +467,17 @@ def run_agent(
                     " Your response was also cut off by the token limit — keep arguments shorter."
                     if getattr(comp, "finish", "") == "length" else ""
                 )
+                msg = _assistant_message(comp)
+                messages.append(msg)
+                for tc in comp.tool_calls:
+                    call_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else "") or "call_err"
+                    call_name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else "") or "tool"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": call_name,
+                        "content": f"error: {call_name} missing required arguments ({'; '.join(bad)})",
+                    })
                 messages.append({
                     "role": "user",
                     "content": (
@@ -319,12 +488,14 @@ def run_agent(
                 })
                 continue
 
-        messages.append(_assistant_message(comp))
+        msg = _assistant_message(comp)
+        if msg.get("tool_calls") or str(msg.get("content") or "").strip():
+            messages.append(msg)
         last = (comp.content or "").strip()
         if comp.tool_calls:
             last = ""
             checkpoint()
-        elif last and on_event:
+        elif last and on_event and not streamed:
             on_event("text", text=last, depth=depth)
         if not comp.tool_calls:
             used_tools = any(m.get("role") == "tool" for m in messages)
@@ -344,18 +515,71 @@ def run_agent(
                     "content": (
                         f"STOP NARRATING (strike {narrate_nudges}). "
                         "Never write sentences like 'Now let me add…' or 'I'll read…'. "
-                        "Call the tool (read_file / list_dir / grep / edit_file / write_file) NOW. "
+                        "Call the tool (read_file / list_dir / grep / bash / edit_file / write_file) NOW. "
                         "No prose before tool calls."
                     ),
                 })
                 continue
-            if not last and used_tools and not nudged:
+            if not last and not nudged:
                 nudged = True
+                dropped = getattr(comp, "finish", "") == "disconnected"
+                if on_event and dropped:
+                    on_event("error", text="stream dropped before any text arrived — retrying", depth=depth)
                 messages.append({
                     "role": "user",
                     "content": (
-                        "You already gathered information with tools. "
-                        "Now write a clear answer and plan for the user. Do not call tools."
+                        "Your previous reply was empty"
+                        + (" — the connection dropped mid-stream." if dropped else ".")
+                        + (
+                            " You already gathered information with tools. "
+                            if used_tools else " "
+                        )
+                        + "Write the full answer and plan for the user now. Do not call tools unless you still lack a specific fact."
+                    ),
+                })
+                continue
+            if not last:
+                if on_event:
+                    on_event(
+                        "error",
+                        text="model returned nothing (empty or dropped stream)",
+                        depth=depth,
+                    )
+                    on_event("turn_end", depth=depth)
+                return AgentResult(last, messages, steps, status="empty")
+            goal = _goal_text(messages)
+            impl = (
+                True if completion_mode == "implementation"
+                else False if completion_mode == "plan"
+                else is_implementation_request(goal)
+            )
+            reason = completion_check_required(
+                messages, goal, last, implementation_mode=impl,
+            )
+            if reason:
+                if checkins >= MAX_COMPLETION_CHECKINS:
+                    if on_event:
+                        on_event(
+                            "error",
+                            text=f"implementation not verified after {MAX_COMPLETION_CHECKINS} check-ins",
+                            depth=depth,
+                        )
+                        on_event("turn_end", depth=depth)
+                    return AgentResult(last, messages, steps, status="incomplete")
+                checkins += 1
+                if on_event:
+                    on_event(
+                        "completion_check",
+                        text=reason, depth=depth,
+                        index=checkins, limit=MAX_COMPLETION_CHECKINS,
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[LightLX completion check-in {checkins}/{MAX_COMPLETION_CHECKINS}]\n"
+                        f"Task incomplete: {reason}.\n"
+                        "Do not explain, plan, paste code, or claim completion. "
+                        "Call write_file or edit_file NOW, then continue until the requested work is actually complete."
                     ),
                 })
                 continue
@@ -471,8 +695,9 @@ class SubagentLauncher:
         extra = {
             "explore": (
                 "You are a READ-ONLY research subagent. Your report is worthless without tools: "
-                "you MUST call read_file / list_dir / glob / grep / fetch_url before answering. "
-                "Do not edit files or run destructive commands. Gather concrete facts (file paths, "
+                "you MUST call read_file / list_dir / glob / grep / web_search / fetch_url before answering. "
+                "For internet research: web_search first, then fetch_url on 2+ primary sources; cite URLs. "
+                "Do not edit files or run destructive commands. Gather concrete facts (file paths, URLs, "
                 "line numbers, code snippets, function names) and return a dense report the parent "
                 "can act on. Never say 'looks good' without having read the actual files."
             ),
@@ -506,6 +731,9 @@ class SubagentLauncher:
                 temperature=self.temperature, on_event=self.on_event,
                 depth=1, native_tools=self.native_tools,
                 deadline=time.time() + 600,
+                completion_mode="implementation" if kind == "implement" else (
+                    "plan" if kind == "explore" else "auto"
+                ),
             )
         except Exception as e:
             dur = int(time.time() - t0)
@@ -525,6 +753,7 @@ class SubagentLauncher:
         status_txt = {
             "timeout": f"timed out after {_fmt_dur(dur)}",
             "max_iters": f"stopped after {result.steps} steps",
+            "incomplete": "incomplete",
             "error": "failed",
         }.get(status, "done")
         header = (

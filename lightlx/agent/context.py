@@ -134,11 +134,12 @@ def detect_context(provider) -> int:
 
 
 def room_for(context_length, max_tokens) -> int:
+    # Use the model's full window; reserve a proportional reply budget, not a
+    # fixed 2048/8192 clamp, so large local contexts are actually usable.
     ctx = max(int(context_length or DEFAULT_CONTEXT), 1024)
     cap = int(max_tokens or 0)
-    # Auto / "whole window" caps must not eat the compact budget.
     if cap <= 0 or cap > ctx // 2:
-        reply = min(max(ctx // 4, 2048), ctx // 2)
+        reply = max(ctx // 4, 512)
     else:
         reply = max(cap, 256)
     return max(ctx - reply - 256, 512)
@@ -177,7 +178,42 @@ def _blob(messages) -> str:
     return "\n\n".join(parts)
 
 
+def normalize_messages(messages):
+    """Drop junk empty assistants and merge consecutive user/assistant prose."""
+    out = []
+    for raw in messages or []:
+        m = dict(raw)
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, str):
+            m["content"] = content
+        elif content is None:
+            m["content"] = ""
+        if (
+            role == "assistant"
+            and not m.get("tool_calls")
+            and not str(m.get("content") or "").strip()
+        ):
+            continue
+        if out and role == out[-1].get("role") and role in ("user", "assistant"):
+            prev = out[-1]
+            if role == "assistant":
+                if m.get("tool_calls"):
+                    out.append(m)
+                    continue
+                prev_text = str(prev.get("content") or "").strip()
+                new_text = str(m.get("content") or "").strip()
+                if new_text:
+                    prev["content"] = f"{prev_text}\n\n{new_text}".strip() if prev_text else new_text
+                continue
+            prev["content"] = f"{prev.get('content') or ''}\n\n{m.get('content') or ''}".strip()
+            continue
+        out.append(m)
+    return out
+
+
 def sanitize_messages(messages):
+    messages = normalize_messages(messages)
     out = []
     pending = set()
     for m in messages or []:

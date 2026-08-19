@@ -41,6 +41,27 @@ Be specific (file + why). If the diff is empty, say so.
 Summarize in 2–4 bullets, then suggest a conventional commit subject line. If nothing changed, say so.
 """,
     },
+    "kickoff": {
+        "description": "Before a large change: map this repo, optionally web-check unknown APIs, then a sourced improvement plan. Use when starting a big pass on an existing project.",
+        "when_to_use": "Existing experimental repo or unfamiliar API. Do not implement in the kickoff turn.",
+        "body": """## Kickoff protocol (plan only — do not edit files yet)
+
+This workspace is an existing project. Treat local files as the source of truth.
+
+1. Map the repo first: README, layout, how it runs/tests. Use `list_dir` / `glob` /
+   `read_file` / `grep` in this turn. Do NOT spawn several `task` subagents at once
+   on LM Studio — parallel streams get dropped and the plan never arrives. If you
+   use `task`, issue one explore agent, wait for it, then continue.
+2. Web research is optional and only for unknown libraries/APIs. Cap at 3 `web_search`
+   calls in the same turn, then `fetch_url` on official docs. Cite URLs.
+3. Claims table: claim | evidence (path or URL) | note. Flag anything with no path and no URL as UNVERIFIED.
+4. Ranked improvements (P0/P1/P2) with why. Do not `write_file` / `edit_file` / `brain_write`
+   unverified claims. Do not start implementing until the user says to.
+
+Stop after the plan. Keep tool paths short in your own notes (basename is enough).
+The user will type /approve to implement or /deny to discard — do not start coding.
+""",
+    },
 }
 
 
@@ -133,7 +154,10 @@ def _load_skill_md(name, path: Path, source: str) -> Skill | None:
 def discover_skills(workspace) -> dict[str, Skill]:
     found: dict[str, Skill] = {}
     for name, spec in BUNDLED.items():
-        found[name] = Skill(name, spec["description"], spec["body"], "bundled")
+        found[name] = Skill(
+            name, spec["description"], spec["body"], "bundled",
+            when_to_use=spec.get("when_to_use") or "",
+        )
     for source, folder in _skill_dirs(Path(workspace)):
         if not folder.is_dir():
             continue

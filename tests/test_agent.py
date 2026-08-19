@@ -27,6 +27,29 @@ class RepeatTests(unittest.TestCase):
         self.assertTrue(looks_like_tool_narration("The implementation is currently underway via parallel subagents"))
         self.assertTrue(looks_like_tool_narration("I have applied edits to the scan bridge"))
 
+    def test_completion_text_signals(self):
+        from lightlx.agent.parse import completion_text_signals, is_implementation_request
+        yaml = "name: YouGuard\n" + ("key: value\n" * 120)
+        blob = f"```yaml\n{yaml}\n```\nNow I'll write `.github/workflows/ci.yml`."
+        self.assertGreater(len(blob), 1200)
+        sig = completion_text_signals(blob)
+        self.assertTrue(sig["unapplied_code"])
+        self.assertTrue(sig["action_promise"])
+        self.assertIn(".github/workflows/ci.yml", sig["announced_paths"])
+        done = completion_text_signals("Implemented the requested fix.")
+        self.assertTrue(done["done_claim"])
+        tool = completion_text_signals(
+            '<tool_call>\n{"name": "write_file", "arguments": {"path": "a.py", "content": "x"}}\n</tool_call>'
+        )
+        self.assertFalse(tool["unapplied_code"])
+        self.assertTrue(is_implementation_request("Write the files"))
+        self.assertTrue(is_implementation_request("implement the P0 items"))
+        self.assertTrue(is_implementation_request("Please finish implementing the previous kickoff work"))
+        self.assertTrue(is_implementation_request("keep writing the swift files"))
+        self.assertTrue(is_implementation_request("fixing the scan bridge now"))
+        self.assertFalse(is_implementation_request("Why does the agent stop after narration?"))
+        self.assertFalse(is_implementation_request("Follow the kickoff protocol. Topic:\nfoo"))
+
 
 class ParseTests(unittest.TestCase):
     def test_json_block(self):
@@ -81,6 +104,152 @@ class ParseTests(unittest.TestCase):
         _, calls = parse_text_tool_calls(text)
         self.assertEqual(calls[0].name, "read_file")
         self.assertEqual(calls[0].arguments["path"], "a.py")
+
+    def test_mangled_kv_write_file(self):
+        # Weak local models emit a tool call as bare text inside a ```bash
+        # fence with stray closing tags. It must still be recovered so the
+        # file actually gets written.
+        text = (
+            "Now let me write this file:\n\n"
+            "```bash\n"
+            "write_file path=/tmp/quantme/.github/workflows/build.yml "
+            "content=name: Build\n\n"
+            "on:\n  push:\n    branches: [main]\n\n"
+            "jobs:\n  build:\n    runs-on: macos-latest\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+            "```\n"
+        )
+        content, calls = parse_text_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "write_file")
+        self.assertEqual(
+            calls[0].arguments["path"],
+            "/tmp/quantme/.github/workflows/build.yml",
+        )
+        body = calls[0].arguments["content"]
+        self.assertTrue(body.startswith("name: Build"))
+        self.assertIn("runs-on: macos-latest", body)
+        self.assertNotIn("</parameter>", body)
+        self.assertNotIn("</tool_call>", body)
+        self.assertNotIn("write_file", content)
+
+    def test_mangled_kv_bare_read(self):
+        _, calls = parse_text_tool_calls("read_file path=lightlx/agent/loop.py")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].arguments["path"], "lightlx/agent/loop.py")
+
+    def test_mangled_kv_prose_does_not_misfire(self):
+        _, calls = parse_text_tool_calls(
+            "You can call write_file to save the config later."
+        )
+        self.assertEqual(calls, [])
+
+    def test_fenced_bash_shell_call(self):
+        text = (
+            "```bash\n"
+            "find /tmp/quantme -name KICKOFF_PLAN.md -type f 2>/dev/null\n"
+            "```"
+        )
+        _, calls = parse_text_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "bash")
+        self.assertIn("KICKOFF_PLAN.md", calls[0].arguments["command"])
+
+    def test_resume_kickoff_is_implementation(self):
+        from lightlx.agent.parse import is_implementation_request
+        self.assertTrue(is_implementation_request(
+            "Please resume the previous work that the kickoff plan had layed out"
+        ))
+
+
+class ProviderErrorTests(unittest.TestCase):
+    def test_clean_http_error_strips_html(self):
+        from lightlx.agent.providers import _clean_http_error
+
+        html = (
+            '<!DOCTYPE html><html><head><title>Error</title></head>'
+            '<body><pre>Internal Server Error</pre></body></html>'
+        )
+        out = _clean_http_error(html)
+        self.assertEqual(out, "Internal Server Error")
+        self.assertNotIn("<", out)
+
+    def test_http_code_parses(self):
+        from lightlx.agent.providers import _http_code
+
+        self.assertEqual(_http_code(RuntimeError("500 http://x: Internal Server Error")), "500")
+        self.assertEqual(_http_code(RuntimeError("cannot reach x")), "")
+
+
+class StreamGateTests(unittest.TestCase):
+    def _run(self, text, char_by_char=False):
+        from lightlx.agent.parse import StreamGate
+
+        emitted = []
+        hits = {"n": 0}
+        gate = StreamGate(emitted.append, lambda: hits.__setitem__("n", hits["n"] + 1))
+        if char_by_char:
+            for ch in text:
+                gate.feed(ch)
+        else:
+            gate.feed(text)
+        gate.close()
+        return "".join(emitted), gate.suppressed, hits["n"]
+
+    def test_prose_streams(self):
+        out, suppressed, hits = self._run("Here is the plan:\n1. do a thing\n")
+        self.assertFalse(suppressed)
+        self.assertEqual(hits, 0)
+        self.assertIn("Here is the plan:", out)
+
+    def test_genuine_code_fence_streams(self):
+        text = "See this:\n```python\nprint('hello world here')\n```\n"
+        out, suppressed, hits = self._run(text)
+        self.assertFalse(suppressed)
+        self.assertIn("print('hello world here')", out)
+
+    def test_fenced_tool_call_suppressed(self):
+        text = (
+            "Now let me write this file:\n\n"
+            "```bash\n"
+            "write_file path=/tmp/a.yml content=name: Build\n"
+            "on:\n  push:\n</tool_call>\n```\n"
+        )
+        out, suppressed, hits = self._run(text)
+        self.assertTrue(suppressed)
+        self.assertEqual(hits, 1)
+        self.assertIn("Now let me write this file:", out)
+        self.assertNotIn("write_file", out)
+        self.assertNotIn("name: Build", out)
+
+    def test_fenced_tool_call_suppressed_char_stream(self):
+        text = (
+            "```bash\nwrite_file path=/tmp/a.yml content=name: Build\nmore\n```\n"
+        )
+        out, suppressed, hits = self._run(text, char_by_char=True)
+        self.assertTrue(suppressed)
+        self.assertNotIn("write_file", out)
+
+    def test_shell_fence_suppressed(self):
+        text = (
+            "```bash\n"
+            "find /tmp -name KICKOFF_PLAN.md 2>/dev/null\n"
+            "```\n"
+        )
+        out, suppressed, hits = self._run(text)
+        self.assertTrue(suppressed)
+        self.assertNotIn("find", out)
+        self.assertEqual(hits, 1)
+
+    def test_bare_tool_call_suppressed(self):
+        out, suppressed, hits = self._run("write_file path=x.txt content=hi\n")
+        self.assertTrue(suppressed)
+        self.assertEqual(out, "")
+
+    def test_tool_call_xml_suppressed(self):
+        out, suppressed, hits = self._run("<tool_call>\nbash\n</tool_call>\n")
+        self.assertTrue(suppressed)
 
 
 class StreamAccTests(unittest.TestCase):
@@ -163,6 +332,10 @@ class ToolsTests(unittest.TestCase):
 
     def test_summarize(self):
         self.assertEqual(summarize_call("bash", {"command": "ls"}), "bash  ls")
+        longp = "/Users/dewaldnel/Library/Mobile Documents/com~apple~CloudDocs/NelCapital Stuff/Experimental/9.0/app.py"
+        s = summarize_call("read_file", {"path": longp})
+        self.assertNotIn("Mobile Documents", s)
+        self.assertIn("app.py", s)
 
     def test_docs_alias(self):
         self.assertEqual(DOC_ALIASES["claude-code"], "anthropics/claude-code")
@@ -260,8 +433,25 @@ class ContextTests(unittest.TestCase):
         self.assertGreater(room_for(50432, 0), 10_000)
         self.assertGreater(room_for(50432, 50432), 10_000)
 
+    def test_full_window_not_clamped(self):
+        # Large local windows should be used for replies, not clamped to a
+        # small fixed cap.
+        from lightlx.agent.context import completion_tokens, room_for
+        msgs = [{"role": "user", "content": "hi"}]
+        big = completion_tokens(msgs, context_length=131072, cap=0)
+        self.assertGreater(big, 100_000)
+        # room_for scales with the window rather than capping at a fixed 2048
+        self.assertGreater(room_for(262144, 0), 190_000)
+
+    def test_mlx_default_ctx_limit_lifted(self):
+        import inspect
+        from lightlx.agent.providers import MlxLocal
+        sig = inspect.signature(MlxLocal.__init__)
+        default = sig.parameters["ctx_limit"].default
+        self.assertGreaterEqual(default, 32768)
+
     def test_sanitize_drops_orphan_tools(self):
-        from lightlx.agent.context import sanitize_messages
+        from lightlx.agent.context import normalize_messages, sanitize_messages
         from lightlx.agent.types import ToolCall
         tc = ToolCall(id="c1", name="read_file", arguments={"path": "a"})
         msgs = [
@@ -273,6 +463,20 @@ class ContextTests(unittest.TestCase):
         out = sanitize_messages(msgs)
         self.assertEqual([m["role"] for m in out], ["user", "assistant", "tool"])
         self.assertEqual(out[-1]["content"], "ok")
+
+    def test_normalize_merges_empty_assistants(self):
+        from lightlx.agent.context import normalize_messages
+
+        raw = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "part one"},
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "part two"},
+            {"role": "user", "content": "again"},
+        ]
+        out = normalize_messages(raw)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[1]["content"], "part one\n\npart two")
 
     def test_compact_keeps_recent(self):
         from lightlx.agent.context import compact_messages
@@ -383,7 +587,7 @@ class LoadedModelTests(unittest.TestCase):
         from lightlx.agent.providers import infer_caps, runtime_notice
         details = {
             "qwen": {"capabilities": ["tool_use"], "context": 50432},
-            "tiny": {"capabilities": ["tool_use"], "context": 4096},
+            "tiny": {"capabilities": ["tool_use"], "context": 2048},
             "plain": {"capabilities": [], "context": 32768},
             "unknown": {"capabilities": None, "context": 32768},
         }
@@ -580,8 +784,194 @@ class CompatLoopTests(unittest.TestCase):
             Looping(), [{"role": "user", "content": "x"}], registry,
             native_tools=False, max_iters=2,
         )
-        # empty completions with no tools end as done (nudged or not)
-        self.assertIn(result.status, ("done", "max_iters"))
+        self.assertEqual(result.status, "empty")
+
+    def test_empty_then_plan(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolSpec
+
+        class OnceEmpty:
+            parallel_safe = True
+
+            def __init__(self):
+                self.n = 0
+
+            def complete(self, messages, **kwargs):
+                self.n += 1
+                if self.n == 1:
+                    return Completion("", [], "disconnected")
+                return Completion("# Plan\n1. map repo", [], "stop")
+
+        registry = {
+            "read_file": ToolSpec("read_file", "r", {"type": "object", "properties": {}}, lambda **k: ""),
+        }
+        result = run_agent(
+            OnceEmpty(), [{"role": "user", "content": "kickoff"}], registry,
+            native_tools=False, max_iters=5,
+        )
+        self.assertEqual(result.status, "done")
+        self.assertIn("Plan", result.text)
+
+
+class CompletionLoopTests(unittest.TestCase):
+    def _registry(self):
+        from lightlx.agent.types import ToolSpec
+        written = {}
+
+        def write_file(path, content=""):
+            written[path] = content
+            return "ok"
+
+        def grep(pattern="", path="."):
+            return "no matches"
+
+        def edit_file(path, old_string="", new_string=""):
+            written[path] = new_string
+            return "ok"
+
+        registry = {
+            "write_file": ToolSpec(
+                "write_file", "w",
+                {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                 "required": ["path", "content"]},
+                write_file,
+            ),
+            "edit_file": ToolSpec(
+                "edit_file", "e",
+                {"type": "object", "properties": {
+                    "path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"},
+                }, "required": ["path", "old_string", "new_string"]},
+                edit_file,
+            ),
+            "grep": ToolSpec(
+                "grep", "g",
+                {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+                grep,
+            ),
+        }
+        return registry, written
+
+    def test_long_narration_then_write(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolCall
+        registry, written = self._registry()
+        events = []
+        yaml = "name: YouGuard\n" + ("key: value\n" * 120)
+        dump = f"```yaml\n{yaml}\n```\nNow I'll write `.github/workflows/ci.yml`."
+
+        class Fake:
+            parallel_safe = False
+
+            def __init__(self):
+                self.n = 0
+
+            def complete(self, messages, tools=None, **kwargs):
+                self.n += 1
+                if self.n == 1:
+                    return Completion(dump, [], "stop")
+                if self.n == 2:
+                    return Completion("", [ToolCall(
+                        id="w1", name="write_file",
+                        arguments={"path": ".github/workflows/ci.yml", "content": "ok"},
+                    )], "tool_calls")
+                return Completion("Implemented CI workflow.", [], "stop")
+
+        fake = Fake()
+        result = run_agent(
+            fake, [{"role": "user", "content": "Write the CI workflow files"}],
+            registry, native_tools=True, max_iters=10,
+            on_event=lambda kind, **kw: events.append((kind, kw)),
+            completion_mode="implementation",
+        )
+        checks = [e for e in events if e[0] == "completion_check"]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(written[".github/workflows/ci.yml"], "ok")
+        self.assertEqual(result.status, "done")
+        self.assertEqual(fake.n, 3)
+
+    def test_search_only_false_done(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolCall
+        registry, written = self._registry()
+        events = []
+
+        class Fake:
+            parallel_safe = False
+
+            def __init__(self):
+                self.n = 0
+
+            def complete(self, messages, tools=None, **kwargs):
+                self.n += 1
+                if self.n == 1:
+                    return Completion("", [ToolCall(
+                        id="g1", name="grep", arguments={"pattern": "embedding"},
+                    )], "tool_calls")
+                return Completion("Done.", [], "stop")
+
+        fake = Fake()
+        result = run_agent(
+            fake, [{"role": "user", "content": "implement persist embeddings"}],
+            registry, native_tools=True, max_iters=20,
+            on_event=lambda kind, **kw: events.append((kind, kw)),
+            completion_mode="implementation",
+        )
+        checks = [e for e in events if e[0] == "completion_check"]
+        self.assertEqual(len(checks), 6)
+        self.assertFalse(written)
+        self.assertEqual(result.status, "incomplete")
+        self.assertEqual(fake.n, 8)
+
+    def test_qa_not_forced(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion
+        registry, _ = self._registry()
+        events = []
+
+        class Fake:
+            parallel_safe = True
+
+            def complete(self, messages, **kwargs):
+                return Completion("run_agent ends a turn when a completion has no tool calls.", [], "stop")
+
+        result = run_agent(
+            Fake(), [{"role": "user", "content": "Why does the agent stop after narration?"}],
+            registry, native_tools=False, max_iters=5,
+            on_event=lambda kind, **kw: events.append((kind, kw)),
+            completion_mode="auto",
+        )
+        self.assertEqual(result.status, "done")
+        self.assertFalse(any(e[0] == "completion_check" for e in events))
+
+    def test_kickoff_plan_not_forced(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion
+        registry, written = self._registry()
+        events = []
+
+        class Fake:
+            parallel_safe = True
+
+            def complete(self, messages, **kwargs):
+                return Completion("## Plan\n1. map repo\n2. add tests", [], "stop")
+
+        result = run_agent(
+            Fake(), [{"role": "user", "content": "Follow the kickoff protocol. Topic:\nfoo"}],
+            registry, native_tools=False, max_iters=5,
+            on_event=lambda kind, **kw: events.append((kind, kw)),
+            completion_mode="plan",
+        )
+        self.assertEqual(result.status, "done")
+        self.assertFalse(any(e[0] == "completion_check" for e in events))
+        self.assertFalse(written)
+
+    def test_lmstudio_serializes_tools(self):
+        from lightlx.agent.providers import LMStudio, StreamAcc
+        self.assertFalse(LMStudio("qwen").parallel_safe)
+        acc = StreamAcc()
+        think = "Wait. " * 40
+        acc.feed({"choices": [{"delta": {"reasoning_content": think}}]})
+        self.assertFalse(acc.looped)
 
 
 class SessionPersistTests(unittest.TestCase):
@@ -659,6 +1049,206 @@ class ChatBarTests(unittest.TestCase):
         self.assertEqual(len(bar), 80)
         busy = format_bar(sess, cols=60, busy=True, color=False)
         self.assertIn("working", busy)
+
+        from lightlx.agent.ui import filter_slash, footer_rows, format_input_line
+        sb, mt, ir, sr = footer_rows(32, 0)
+        self.assertEqual((ir, sr), (31, 32))
+        self.assertEqual(sb, 30)
+        sb2, mt2, ir2, sr2 = footer_rows(32, 3)
+        self.assertEqual((ir2, sr2), (31, 32))
+        self.assertLess(mt2, ir2)
+        self.assertLess(sb2, mt2)
+        raw = __import__("re").sub(r"\033\[[0-9;]*m", "", format_input_line("hello", 40))
+        self.assertEqual(len(raw), 40)
+        self.assertIn("›", raw)
+        self.assertEqual(filter_slash([("/kickoff", "x"), ("/brain", "y")], "/kickoff How"), [])
+
+    def test_slash_enter_submits_exact_brain(self):
+        from lightlx.agent.ui import SLASH_COMMANDS, slash_enter
+        buf, submit = slash_enter("/brain", SLASH_COMMANDS)
+        self.assertTrue(submit)
+        self.assertEqual(buf, "/brain")
+        buf, submit = slash_enter("/br", SLASH_COMMANDS)
+        self.assertFalse(submit)
+        self.assertEqual(buf, "/brain ")
+        buf, submit = slash_enter("/help", SLASH_COMMANDS)
+        self.assertTrue(submit)
+        self.assertEqual(buf, "/help")
+        buf, submit = slash_enter("/he", SLASH_COMMANDS)
+        self.assertTrue(submit)
+        self.assertEqual(buf, "/help")
+
+    def test_sticky_bar_is_opt_in(self):
+        from lightlx.agent.ui import ChatBar
+        old = os.environ.pop("LIGHTLX_STICKY_BAR", None)
+        try:
+            self.assertFalse(ChatBar().enabled)
+        finally:
+            if old is not None:
+                os.environ["LIGHTLX_STICKY_BAR"] = old
+
+    def test_slash_filter(self):
+        from lightlx.agent.ui import SLASH_COMMANDS, filter_slash, slash_catalog
+        all_open = filter_slash(SLASH_COMMANDS, "/")
+        self.assertTrue(all_open)
+        self.assertTrue(any(c == "/kickoff" for c, _ in SLASH_COMMANDS))
+        hits = filter_slash(SLASH_COMMANDS, "/br")
+        self.assertEqual(hits[0][0], "/brain")
+        self.assertEqual(filter_slash(SLASH_COMMANDS, "hello"), [])
+
+        class Sk:
+            name = "code-review"
+            user_invocable = True
+            description = "Review the diff"
+
+        class Sess:
+            skills = {"code-review": Sk()}
+
+        cat = slash_catalog(Sess())
+        self.assertTrue(any(c == "/code-review" for c, _ in cat))
+
+
+class BrainTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "brain"
+        import lightlx.agent.brain as brain
+        self.brain = brain
+        self._old = brain.BRAIN_ROOT
+        brain.BRAIN_ROOT = self.root
+
+    def tearDown(self):
+        self.brain.BRAIN_ROOT = self._old
+        self.tmp.cleanup()
+
+    def test_redact(self):
+        from lightlx.agent.brain import redact
+        t = redact("mail a@b.com token=sk-abc123456789 key AKIAIOSFODNN7EXAMPLE")
+        self.assertNotIn("a@b.com", t)
+        self.assertNotIn("sk-abc", t)
+        self.assertIn("[redacted", t)
+
+    def test_digest_skips_low_idle(self):
+        from lightlx.agent.brain import digest_for_prompt, write_record
+        write_record("correction", "use pnpm not npm", source="user", confidence="high", root=self.root)
+        write_record("gotcha", "invented api", source="idle-extract", confidence="low", root=self.root)
+        d = digest_for_prompt(self.root)
+        self.assertIn("pnpm", d)
+        self.assertNotIn("invented api", d)
+
+    def test_search_and_jobs(self):
+        from lightlx.agent.brain import brain_search, claim, complete, enqueue, init_jobs, write_record
+        write_record("preference", "2-space indent", source="user", root=self.root)
+        self.assertIn("2-space", brain_search("2-space", root=self.root))
+        init_jobs(self.root)
+        enqueue("s1", "/tmp/x.json", root=self.root)
+        job = claim(now=1e12, root=self.root)
+        self.assertEqual(job["session_id"], "s1")
+        complete("s1", root=self.root)
+        self.assertIsNone(claim(now=1e12, root=self.root))
+
+    def test_skip_short_session(self):
+        from lightlx.agent.brain import should_extract_session
+        rec = {"history": [{"role": "user", "content": "hi"}], "updated": "2000-01-01T00:00:00Z"}
+        self.assertFalse(should_extract_session(rec, idle_seconds=1, min_turns=4))
+        rec["history"] = [{"role": "user", "content": "x"}] * 5
+        p = Path(self.tmp.name) / "sess.json"
+        p.write_text(json.dumps(rec))
+        os.utime(p, (0, 0))
+        self.assertTrue(should_extract_session(p, idle_seconds=1, now=1e12, min_turns=4))
+
+    def test_tick_disabled(self):
+        from lightlx.agent.brain import tick_idle
+        self.assertEqual(tick_idle({"brain.enabled": False}, busy=False, root=self.root), "")
+
+    def test_ddg_parse_and_claims(self):
+        from lightlx.agent.brain import claims_missing_sources, parse_ddg_html
+        html = '<a class="result__a" href="https://example.com/docs">Official Docs</a>'
+        rows = parse_ddg_html(html)
+        self.assertEqual(rows[0]["url"], "https://example.com/docs")
+        missing = claims_missing_sources("- the widget API uses /v9/frobnicate\n- see https://example.com/v9")
+        self.assertTrue(any("frobnicate" in x for x in missing))
+        self.assertFalse(any("example.com/v9" in x for x in missing))
+
+    def test_path_scoped_rules(self):
+        from lightlx.agent.memory import load_instructions
+        ws = Path(self.tmp.name) / "proj"
+        rules = ws / ".lightlx" / "rules"
+        rules.mkdir(parents=True)
+        (rules / "py.md").write_text("---\npaths:\n  - \"*.py\"\n---\nUse ruff.\n")
+        (rules / "always.md").write_text("Always be kind.\n")
+        always = "\n".join(b for _, b in load_instructions(ws))
+        self.assertIn("kind", always)
+        self.assertNotIn("ruff", always)
+        matched = "\n".join(b for _, b in load_instructions(ws, touched_paths=["src/app.py"]))
+        self.assertIn("ruff", matched)
+
+    def test_kickoff_skill_exists(self):
+        from lightlx.agent.skills import discover_skills
+        skills = discover_skills(self.tmp.name)
+        self.assertIn("kickoff", skills)
+        self.assertIn("Claims table", skills["kickoff"].body)
+        self.assertIn("Do not start implementing", skills["kickoff"].body)
+
+    def test_to_openai_messages_raw_arguments_valid_json(self):
+        from lightlx.agent.types import ToolCall
+        from lightlx.agent.providers import to_openai_messages
+        msgs = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                ToolCall("call_1", "bash", {"command": "echo hi"}, raw_arguments="echo hi"),
+            ],
+        }]
+        out = to_openai_messages(msgs)
+        self.assertEqual(len(out), 1)
+        raw_args = out[0]["tool_calls"][0]["function"]["arguments"]
+        # Must be parseable valid JSON string
+        parsed = json.loads(raw_args)
+        self.assertEqual(parsed, {"command": "echo hi"})
+
+    def test_remap_args_strips_null_like_values(self):
+        from lightlx.agent.loop import remap_args
+        from lightlx.agent.types import ToolSpec
+        spec = ToolSpec("bash", "b", {
+            "type": "object",
+            "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}},
+            "required": ["command"],
+        }, lambda **k: "")
+        remapped = remap_args(spec, {"command": "null", "timeout": 60})
+        self.assertNotIn("command", remapped)
+        self.assertEqual(remapped.get("timeout"), 60)
+
+    def test_summarize_call_ignores_null_values(self):
+        from lightlx.agent.tools import summarize_call
+        self.assertEqual(summarize_call("bash", {"command": "null"}), "bash")
+        self.assertEqual(summarize_call("bash", {"command": "ls -la"}), "bash  ls -la")
+
+    def test_bad_tool_call_openai_tool_role_matching(self):
+        from lightlx.agent.loop import run_agent
+        from lightlx.agent.types import Completion, ToolCall, ToolSpec
+
+        class BadFirstProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages, tools=None, max_tokens=256, temperature=0.2, on_text=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return Completion("", [ToolCall("call_bad", "bash", {})], "tool_calls")
+                # In second call, ensure all tool_call_ids have matching tool message
+                tool_ids = [m.get("tool_call_id") for m in messages if m.get("role") == "tool"]
+                assert "call_bad" in tool_ids
+                return Completion("I have fixed the tool call.", [], "stop")
+
+        spec = ToolSpec("bash", "b", {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        }, lambda **k: "ok")
+        prov = BadFirstProvider()
+        res = run_agent(prov, [{"role": "user", "content": "run ls"}], {"bash": spec}, native_tools=True)
+        self.assertEqual(res.status, "done")
 
 
 if __name__ == "__main__":

@@ -1,18 +1,24 @@
 import os
+import shutil
 import sys
+import threading
 import time
 
-from .context import detect_context, estimate_tokens, handoff_note, maybe_compact
+from .context import detect_context, estimate_tokens, handoff_note, maybe_compact, normalize_messages
 from .loop import SubagentLauncher, _fmt_dur, _git_snapshot, run_agent, seed_messages
 from .ui import ChatBar
 from .providers import refresh_remote_provider, runtime_notice
 from .mcp import MCPHub, load_mcp_config
 from .memory import format_instructions, init_project, load_instructions
 from .memory import MemoryStore
+from .brain import (
+    consolidate, digest_for_prompt, import_foreign_memories,
+    import_instructions as import_brain_instructions, tick_idle,
+)
 from .prompts import DOC_ALIASES
-from .sessions import age, hydrate_messages, list_sessions, load_session, record_from, save_session, title_from
+from .sessions import age, hydrate_messages, idle_session_paths, list_sessions, load_session, record_from, save_session, title_from
 from .skills import catalog, discover_skills, expand_skill, import_skills, list_importable
-from .tools import BuiltinTools, Workspace
+from .tools import BuiltinTools, Workspace, _short_label
 
 HELP = """commands
   /menu          settings
@@ -24,7 +30,11 @@ HELP = """commands
   /mcp           MCP servers — status / reload
   /docs          documentation sources (claude-code, codex, …)
   /workspace     show or set the working directory
-  /task          reminder: ask the model to spawn parallel subagents
+  /task          spawn a subagent (one at a time on LM Studio)
+  /kickoff       map the repo, then a sourced plan (then /approve or /deny)
+  /approve       implement the most recent kickoff plan
+  /deny          discard the most recent kickoff plan
+  /brain         cross-project memory (status, search, on/off, import)
   /tokens auto|N  reply cap (auto = remaining context)
   /compact       summarize older turns to free context
   /resume        resume a saved session
@@ -34,7 +44,7 @@ HELP = """commands
   /model         switch model / backend (keeps chat — same as /handoff)
   /help          show this
   /exit          quit
-type /skill-name to run a skill   ·   Ctrl-C stops a turn"""
+type / for the command palette   ·   Ctrl-C stops a turn"""
 
 
 def _dim(s):
@@ -53,6 +63,41 @@ def _err(s):
     return f"\033[31m{s}\033[0m"
 
 
+class _Spinner:
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label):
+        self.label = label
+        self._stop = threading.Event()
+        self._t = None
+
+    def start(self):
+        if not sys.stdout.isatty():
+            print(_dim(f"  ▸ {self.label}"))
+            return
+
+        def run():
+            i = 0
+            while not self._stop.is_set():
+                frame = self.FRAMES[i % len(self.FRAMES)]
+                sys.stdout.write(f"\r\033[K{_dim(f'  {frame} {self.label}')}")
+                sys.stdout.flush()
+                i += 1
+                self._stop.wait(0.08)
+
+        self._t = threading.Thread(target=run, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._t:
+            self._t.join(timeout=0.3)
+            self._t = None
+        if sys.stdout.isatty():
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
 class AgentSession:
     def __init__(self, provider, workspace, prefs, on_switch=None, native_tools=True, source=None):
         self.provider = provider
@@ -65,6 +110,7 @@ class AgentSession:
         self.source = source or {}
         self.history = []
         self.pending = None
+        self.kickoff_plan = None
         self.session_id = None
         self.last_turn = None
         self.hub = MCPHub()
@@ -118,6 +164,7 @@ class AgentSession:
             format_instructions(self.instructions),
             catalog(self.skills),
             self.memory.format_for_prompt(),
+            digest_for_prompt(),
         ]
         return "\n\n".join(p for p in parts if p)
 
@@ -126,6 +173,17 @@ class AgentSession:
             return
         rec = record_from(self, self.source)
         self.session_id = save_session(rec)
+
+    def tick_brain(self, busy=False):
+        try:
+            return tick_idle(
+                self.prefs, busy=busy, provider=None if busy else self.provider,
+                list_session_files=lambda: idle_session_paths(
+                    int(self.prefs.get("brain.idle_seconds") or 900)
+                ),
+            )
+        except Exception:
+            return ""
 
     def checkpoint(self, messages):
         self.pending = [m for m in (messages or []) if m.get("role") != "system"]
@@ -170,15 +228,35 @@ def _indent(depth):
     return "  " + ("  " * depth)
 
 
+def _short_tool_label(text):
+    return _short_label(text, 32)
+
+
 def make_printer():
     started = {"n": False}
     tool_stack = {}
     read_group = {"active": False, "names": []}
     subagent_stack = {}
+    spin = {"obj": None}
+
+    def _stop_spin():
+        if spin["obj"] is not None:
+            spin["obj"].stop()
+            spin["obj"] = None
 
     def on_event(kind, text="", name="", detail="", depth=0, ok=True, **kw):
         pad = "  " + ("  " * depth)
         key = kw.get("key") or name
+        if kind != "tool_stream":
+            _stop_spin()
+        if kind == "tool_stream":
+            if started["n"]:
+                print()
+                started["n"] = False
+            _stop_spin()
+            spin["obj"] = _Spinner(text or "preparing tool call…")
+            spin["obj"].start()
+            return
         if kind == "text":
             if not started["n"]:
                 print()
@@ -193,7 +271,7 @@ def make_printer():
                 print()
                 started["n"] = False
             tool_stack[key] = {"detail": detail or name, "t0": time.time(), "name": name}
-            if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
+            if name in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs", "web_search", "brain_search"):
                 read_group["active"] = True
                 read_group["names"].append(detail or name)
                 _render_read_group(pad)
@@ -208,7 +286,7 @@ def make_printer():
             mark = _ok("✓") if ok else _err("✗")
             tail = f" {_dim(f'{dur:.1f}s')}" if dur > 0.2 else ""
             shown = info.get("name") or name
-            if shown in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs"):
+            if shown in ("read_file", "list_dir", "glob", "grep", "fetch_url", "docs", "web_search", "brain_search"):
                 read_group["names"] = [n for n in read_group["names"] if n != (detail or name)]
                 if not read_group["names"]:
                     read_group["active"] = False
@@ -258,24 +336,35 @@ def make_printer():
             print(_dim(f"{pad}◎ compacted"))
         elif kind == "error":
             print(_err(f"\n{pad}{text}"))
+        elif kind == "completion_check":
+            if started["n"]:
+                print()
+                started["n"] = False
+            idx = kw.get("index") or 0
+            limit = kw.get("limit") or 0
+            print(_dim(f"{pad}↻ completion check {idx}/{limit}: {text}"))
         elif kind == "turn_end":
             if started["n"]:
                 print()
                 started["n"] = False
 
     def _render_read_group(pad):
-        names = read_group["names"]
+        names = [_short_tool_label(n) for n in read_group["names"]]
         if len(names) == 1:
             label = names[0]
         elif len(names) <= 3:
             label = ", ".join(names)
         else:
             label = f"{', '.join(names[:2])} +{len(names)-2} more"
+        cols = shutil.get_terminal_size((80, 24)).columns
         line = f"{pad}▸ reading {label}"
-        sys.stdout.write("\033[K" + line + "\033[" + str(len(line)) + "D")
+        # Never wrap onto the sticky bar (last row).
+        line = line[: max(12, cols - 1)]
+        sys.stdout.write("\r\033[K" + line)
         sys.stdout.flush()
 
     def reset():
+        _stop_spin()
         started["n"] = False
         tool_stack.clear()
         read_group["active"] = False
@@ -312,6 +401,18 @@ def _tools_http_rejected(err):
     return msg.startswith("400")
 
 
+def _print_provider_error(err):
+    msg = str(err).strip()
+    if msg.startswith("500") and "1234" in msg:
+        print(_dim(
+            "\n  LM Studio returned 500 — the model was likely still busy from the "
+            "previous request. LightLX waited and retried; progress was checkpointed. "
+            "Try again in a few seconds."
+        ))
+        return
+    print(_dim(f"\n  {msg}"))
+
+
 def _finish_turn(sess, result, dur=None):
     sess.pending = None
     sess.history = [m for m in (result.messages or []) if m.get("role") != "system"]
@@ -346,6 +447,13 @@ def _finish_turn(sess, result, dur=None):
             if len(line) > 120:
                 line = line[:117] + "…"
             print(_dim(f"  changed: {line}"))
+    if getattr(result, "status", "done") == "empty":
+        print(_dim("  model returned nothing — stream dropped or empty. Try the prompt again."))
+    elif getattr(result, "status", "done") == "incomplete":
+        print(_dim(
+            "  implementation appears incomplete after 6 check-ins — "
+            "session saved; inspect changes or continue with a specific instruction."
+        ))
     sess.persist()
 
 
@@ -368,6 +476,7 @@ def resume_pending(sess, on_event):
             on_event=on_event, native_tools=sess.native_tools,
             context_length=sess.context_length,
             on_checkpoint=sess.checkpoint,
+            completion_mode="auto",
         )
     except KeyboardInterrupt:
         print(_dim("\n— stopped — checkpoint saved. resume next launch."))
@@ -377,12 +486,13 @@ def resume_pending(sess, on_event):
             sess.native_tools = False
             print(_dim("  model rejected the tools parameter — switching to text tool-call mode"))
             return resume_pending(sess, on_event)
-        print(_dim(f"\n  {e}"))
+        _print_provider_error(e)
+        sess.persist()
         return
     _finish_turn(sess, result, dur=time.time() - t0)
 
 
-def run_turn(sess, user_text, on_event):
+def run_turn(sess, user_text, on_event, completion_mode="auto"):
     for line in sess.refresh_runtime(announce=True):
         print(_dim("  " + line))
     registry = _bind_events(sess, on_event)
@@ -404,10 +514,11 @@ def run_turn(sess, user_text, on_event):
             on_event=on_event, native_tools=sess.native_tools,
             context_length=sess.context_length,
             on_checkpoint=sess.checkpoint,
+            completion_mode=completion_mode,
         )
     except KeyboardInterrupt:
         print(_dim("\n— stopped — checkpoint saved. pick Resume next time."))
-        return
+        return None
     except Exception as e:
         if sess.native_tools and _tools_http_rejected(e):
             if sess.history and sess.history[-1].get("role") == "user":
@@ -415,13 +526,14 @@ def run_turn(sess, user_text, on_event):
             sess.pending = None
             sess.native_tools = False
             print(_dim("  model rejected the tools parameter — switching to text tool-call mode"))
-            return run_turn(sess, user_text, on_event)
-        print(_dim(f"\n  {e}"))
-        sess.history.pop()
-        sess.pending = None
+            return run_turn(sess, user_text, on_event, completion_mode=completion_mode)
+        _print_provider_error(e)
+        if not sess.pending and sess.history and sess.history[-1].get("role") == "user":
+            sess.history.pop()
         sess.persist()
-        return
+        return None
     _finish_turn(sess, result, dur=time.time() - t0)
+    return result
 
 
 def _prompt_line(sess):
@@ -569,11 +681,50 @@ def _import_menu(sess):
     print(_dim(f"  {len(sess.skills)} skills loaded"))
 
 
+def _brain_cmd(sess, arg):
+    from .brain import brain_search, count_pending_episodes, ensure_layout
+    parts = (arg or "").split(maxsplit=1)
+    cmd = (parts[0] if parts else "").lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if cmd in ("on", "enable"):
+        sess.prefs["brain.enabled"] = True
+        print(_dim("  brain idle extract ON (runs after sessions sit idle — not every turn)"))
+        return
+    if cmd in ("off", "disable"):
+        sess.prefs["brain.enabled"] = False
+        print(_dim("  brain idle extract OFF"))
+        return
+    if cmd == "search":
+        print(brain_search(rest or ""))
+        return
+    if cmd == "compact":
+        print(_dim("  " + consolidate()))
+        return
+    if cmd == "import":
+        print(_dim("  " + import_brain_instructions()))
+        print(_dim("  " + import_foreign_memories()))
+        return
+    if cmd == "digest":
+        text = digest_for_prompt() or "(empty digest)"
+        print(text[:4000])
+        return
+    root = ensure_layout()
+    on = sess.prefs.get("brain.enabled", False)
+    idle = sess.prefs.get("brain.idle_seconds", 900)
+    n = count_pending_episodes()
+    digest = digest_for_prompt()
+    lines = (digest or "").count("\n")
+    print(_dim(f"  enabled={on}  idle={idle}s  digest_lines={lines}  episodes={n}"))
+    print(_dim(f"  {root}"))
+    print(_dim("  /brain on|off · /brain search Q · /brain digest · /brain compact · /brain import"))
+
+
 def apply_record(sess, rec):
     if not rec:
         return False
-    sess.history = list(rec.get("history") or [])
-    sess.pending = rec.get("pending") or None
+    sess.history = normalize_messages(list(rec.get("history") or []))
+    pending = rec.get("pending")
+    sess.pending = normalize_messages(pending) if pending else None
     sess.session_id = rec.get("id")
     ws = rec.get("workspace")
     if ws and os.path.isdir(ws):
@@ -589,7 +740,10 @@ def agent_repl(sess, switch_cb=None):
     for line in getattr(sess, "_notices", []) or []:
         print(_dim("  " + line))
     sess._notices = []
-    print(_dim("  /menu · /skills · /memory · /help · /exit"))
+    note = sess.tick_brain(busy=False)
+    if note:
+        print(_dim("  brain: " + note))
+    print(_dim("  type / for commands · /help · /exit"))
     printer = make_printer()
     bar = ChatBar()
     bar.attach(sess)
@@ -619,7 +773,7 @@ def agent_repl(sess, switch_cb=None):
             if line in ("/exit", "/quit", "exit", "quit", "/q"):
                 sess.persist()
                 return
-            if line in ("/menu", "/", "/settings"):
+            if line in ("/menu", "/settings"):
                 with bar.paused():
                     action = settings_menu(sess)
                 if action == "quit":
@@ -661,6 +815,60 @@ def agent_repl(sess, switch_cb=None):
                         print("  " + line_s)
                 else:
                     print(_dim("  no MCP servers. add ~/.lightlx/mcp.json  (see /help)"))
+                continue
+            if line == "/approve":
+                plan = (sess.kickoff_plan or "").strip()
+                if not plan:
+                    print(_dim("  no kickoff plan is awaiting approval — run /kickoff first"))
+                    continue
+                sess.kickoff_plan = None
+                printer.reset()
+                bar.busy = True
+                bar.refresh()
+                run_turn(
+                    sess,
+                    "The user approved this kickoff plan. Implement it now. "
+                    "Make the requested code changes, verify them, and report the results.\n\n"
+                    + plan,
+                    on_event,
+                    completion_mode="implementation",
+                )
+                bar.busy = False
+                bar.refresh()
+                continue
+            if line == "/deny":
+                if sess.kickoff_plan:
+                    sess.kickoff_plan = None
+                    print(_dim("  kickoff plan discarded — no implementation was started"))
+                else:
+                    print(_dim("  no kickoff plan is awaiting approval"))
+                continue
+            if line.startswith("/kickoff"):
+                topic = line.partition(" ")[2].strip() or "(use the conversation so far)"
+                sk = sess.skills.get("kickoff")
+                body = expand_skill(sk, topic, workspace=str(sess.ws.root)) if sk else topic
+                printer.reset()
+                bar.busy = True
+                bar.refresh()
+                result = run_turn(
+                    sess,
+                    "Follow the kickoff protocol. Topic:\n" + topic + "\n\n" + body,
+                    on_event,
+                    completion_mode="plan",
+                )
+                bar.busy = False
+                bar.refresh()
+                plan = (getattr(result, "text", None) or "").strip()
+                if plan:
+                    sess.kickoff_plan = plan
+                    print(_dim("  plan is awaiting approval — /approve to implement · /deny to discard"))
+                else:
+                    print(_dim("  no plan was produced — nothing is awaiting approval"))
+                continue
+            if line.startswith("/brain"):
+                arg = line.partition(" ")[2].strip()
+                _brain_cmd(sess, arg)
+                bar.refresh()
                 continue
             if line == "/task":
                 if not sess.allow_subagents:

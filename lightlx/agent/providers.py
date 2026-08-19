@@ -1,5 +1,8 @@
 import json
 import os
+import re
+import threading
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -36,7 +39,7 @@ def http_json(method, url, body=None, headers=None, timeout=15):
             raw = r.read().decode()
             return (json.loads(raw) if raw else {}), getattr(r, "status", 200)
     except urllib.error.HTTPError as e:
-        err = e.read().decode(errors="replace")[:800]
+        err = _clean_http_error(e.read().decode(errors="replace"))
         raise RuntimeError(f"{e.code} {url}: {err}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"cannot reach {url}: {e.reason}") from e
@@ -160,7 +163,9 @@ def infer_caps(details, model_id, context_length=0):
         info = caps_from_list(raw)
     ctx = int(d.get("context") or context_length or 0)
     info["context"] = ctx
-    info["subagents"] = bool(info["tools"] and (not ctx or ctx >= 8192))
+    # Subagents need headroom for a fresh system+task prompt alongside the
+    # parent context; 4096 is enough. Avoid hardcoding a large 8192 gate.
+    info["subagents"] = bool(info["tools"] and (not ctx or ctx >= 4096))
     return info
 
 
@@ -264,7 +269,7 @@ def refresh_remote_provider(provider):
         tools = True
         return {
             "model": getattr(provider, "model", None) or getattr(provider, "label", ""),
-            "caps": {"tools": tools, "subagents": bool(not ctx or ctx >= 8192), "raw": [], "context": ctx},
+            "caps": {"tools": tools, "subagents": bool(not ctx or ctx >= 4096), "raw": [], "context": ctx},
         }
     if kind == "lmstudio":
         info = probe_lmstudio(getattr(provider, "base_url", None), getattr(provider, "api_key", None))
@@ -303,7 +308,7 @@ def refresh_remote_provider(provider):
         "tools": ocap.get("tools", True) if ocap else True,
         "raw": (ocap or {}).get("raw") or [],
         "context": ctx,
-        "subagents": bool((ocap.get("tools", True) if ocap else True) and (not ctx or ctx >= 8192)),
+        "subagents": bool((ocap.get("tools", True) if ocap else True) and (not ctx or ctx >= 4096)),
     }
     provider.capabilities = caps
     return {"model": model, "caps": caps}
@@ -419,7 +424,10 @@ class StreamAcc:
                         existing.update(args)
                         slot["arguments"] = json.dumps(existing)
         blob = "".join(self.content)
-        if is_repeating(blob) or is_repeating("".join(self.reasoning)):
+        # Only abort on repeating *answer* tokens. Qwen-style reasoning often
+        # loops "wait/hmm" and aborting that closes the LM Studio socket before
+        # any plan text is produced.
+        if is_repeating(blob):
             self.looped = True
             pieces = []
         return "".join(pieces)
@@ -448,6 +456,7 @@ class StreamAcc:
 class OpenAICompat:
     kind = "openai"
     parallel_safe = True
+    _SLOT_COOLDOWN = 0.0
 
     def __init__(self, base_url, model, api_key=None, timeout=None):
         self.base_url = base_url.rstrip("/")
@@ -457,10 +466,19 @@ class OpenAICompat:
         self.label = model
         self.context_length = 0
         self.frequency_penalty = 0.4
+        self._slot_until = 0.0
+
+    def _wait_slot(self):
+        gap = self._slot_until - time.time()
+        if gap > 0:
+            time.sleep(gap)
+
+    def _cooldown(self, seconds):
+        self._slot_until = max(self._slot_until, time.time() + seconds)
 
     def complete(self, messages, tools=None, max_tokens=4096, temperature=0.2, on_text=None):
-        from .context import sanitize_messages
-        messages = sanitize_messages(messages)
+        from .context import normalize_messages, sanitize_messages
+        messages = sanitize_messages(normalize_messages(messages))
         body = {
             "model": self.model,
             "messages": messages,
@@ -495,14 +513,36 @@ class OpenAICompat:
                 finish = choice.get("finish_reason") or "stop"
                 return Completion(content, calls, "tool_calls" if calls else finish)
 
+        serial = not getattr(self, "parallel_safe", True)
+        attempts = 5 if serial else 1
+        backoff = (3.0, 6.0, 10.0, 15.0) if serial else (1.0, 2.0)
+        self._wait_slot()
         try:
-            return send(body)
-        except RuntimeError as e:
-            if str(e).lstrip().startswith("400") and "frequency_penalty" in body:
-                body = dict(body)
-                body.pop("frequency_penalty", None)
-                return send(body)
-            raise
+            for i in range(attempts):
+                try:
+                    out = send(body)
+                    if serial and getattr(out, "finish", "") == "disconnected":
+                        self._cooldown(4.0)
+                    else:
+                        self._cooldown(self._SLOT_COOLDOWN or 1.0)
+                    return out
+                except RuntimeError as e:
+                    code = _http_code(e)
+                    if code == "400" and "frequency_penalty" in body:
+                        body = dict(body)
+                        body.pop("frequency_penalty", None)
+                        return send(body)
+                    if code in _TRANSIENT_HTTP and i + 1 < attempts:
+                        wait = backoff[min(i, len(backoff) - 1)]
+                        self._cooldown(wait)
+                        self._wait_slot()
+                        continue
+                    if serial and code in _TRANSIENT_HTTP:
+                        self._cooldown(10.0)
+                    raise
+        finally:
+            if serial:
+                self._cooldown(self._SLOT_COOLDOWN or 1.0)
 
     def _stream(self, url, body, on_text):
         req = urllib.request.Request(
@@ -511,6 +551,8 @@ class OpenAICompat:
         )
         acc = StreamAcc()
         finish = "stop"
+        saw_done = False
+        aborted = False
         try:
             with urllib.request.urlopen(req, timeout=self.timeout or 600) as resp:
                 buf = b""
@@ -526,6 +568,7 @@ class OpenAICompat:
                             continue
                         payload = s[5:].strip()
                         if payload == "[DONE]":
+                            saw_done = True
                             return acc.result(finish)
                         try:
                             data = json.loads(payload)
@@ -535,16 +578,52 @@ class OpenAICompat:
                         if piece and on_text:
                             on_text(piece)
                         if acc.looped:
-                            return acc.result("stop")
+                            aborted = True
+                            break
                         for c in data.get("choices") or []:
                             if c.get("finish_reason"):
                                 finish = c["finish_reason"]
+                    if aborted:
+                        # Drain the socket so LM Studio can finish cleanly
+                        # before LightLX opens the next request.
+                        while resp.read(4096):
+                            pass
+                        break
         except urllib.error.HTTPError as e:
-            err = e.read().decode(errors="replace")[:800]
+            err = _clean_http_error(e.read().decode(errors="replace"))
+            if not getattr(self, "parallel_safe", True):
+                self._cooldown(6.0)
             raise RuntimeError(f"{e.code} {url}: {err}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"cannot reach {url}: {e.reason}") from e
+        if aborted:
+            self._cooldown(4.0)
+            return acc.result("stop")
+        if not saw_done and finish == "stop":
+            finish = "disconnected"
+            if not getattr(self, "parallel_safe", True):
+                self._cooldown(4.0)
         return acc.result(finish)
+
+
+_TRANSIENT_HTTP = {"408", "409", "425", "429", "500", "502", "503", "504"}
+
+
+def _clean_http_error(err):
+    # LM Studio serves bare HTML error pages on 500s; the real message lives in
+    # the <pre> body. Prefer that, else strip all tags to a single readable line.
+    t = (err or "")[:800]
+    m = re.search(r"<pre[^>]*>(.*?)</pre>", t, re.I | re.S)
+    if m:
+        t = m.group(1)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:160] or "HTTP error"
+
+
+def _http_code(err):
+    m = re.match(r"\s*(\d{3})\b", str(err))
+    return m.group(1) if m else ""
 
 
 class Ollama(OpenAICompat):
@@ -605,7 +684,7 @@ class Ollama(OpenAICompat):
                             raw_arguments=raw_a,
                         ))
         except urllib.error.HTTPError as e:
-            err = e.read().decode(errors="replace")[:800]
+            err = _clean_http_error(e.read().decode(errors="replace"))
             raise RuntimeError(f"{e.code} {url}: {err}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"cannot reach {url}: {e.reason}") from e
@@ -615,11 +694,21 @@ class Ollama(OpenAICompat):
 
 class LMStudio(OpenAICompat):
     kind = "lmstudio"
+    # One loaded model cannot serve several chat streams at once. Parallel
+    # `task` calls make LM Studio drop the parent connection ("Client
+    # disconnected") and LightLX ends the turn with an empty plan.
+    parallel_safe = False
+    _SLOT_COOLDOWN = 0.75
+    _SLOT = threading.Lock()
 
     def __init__(self, model, base_url=None, api_key=None, timeout=None):
         super().__init__(base_url or DEFAULT_LMSTUDIO, model, api_key=api_key or "lm-studio", timeout=timeout)
         self.label = f"lmstudio/{model}"
         self.frequency_penalty = None
+
+    def complete(self, messages, tools=None, max_tokens=4096, temperature=0.2, on_text=None):
+        with self._SLOT:
+            return super().complete(messages, tools, max_tokens, temperature, on_text)
 
 
 class CustomOpenAI(OpenAICompat):
@@ -671,7 +760,7 @@ class MlxLocal:
     kind = "mlx"
     parallel_safe = False
 
-    def __init__(self, generate_fn, model, tok, eos, think=False, ctx_limit=8192, name="mlx"):
+    def __init__(self, generate_fn, model, tok, eos, think=False, ctx_limit=32768, name="mlx"):
         self._generate = generate_fn
         self.model = model
         self.tok = tok
@@ -740,10 +829,18 @@ def to_openai_messages(messages):
             item = {"role": "assistant", "content": message_text(m.get("content")) or None, "tool_calls": []}
             for tc in m["tool_calls"]:
                 if isinstance(tc, ToolCall):
+                    raw = tc.raw_arguments
+                    if raw and isinstance(raw, str):
+                        try:
+                            json.loads(raw)
+                        except Exception:
+                            raw = json.dumps(tc.arguments if isinstance(tc.arguments, dict) else {})
+                    else:
+                        raw = json.dumps(tc.arguments if isinstance(tc.arguments, dict) else {})
                     item["tool_calls"].append({
                         "id": tc.id,
                         "type": "function",
-                        "function": {"name": tc.name, "arguments": tc.raw_arguments or json.dumps(tc.arguments)},
+                        "function": {"name": tc.name, "arguments": raw},
                     })
                 elif isinstance(tc, dict):
                     fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
@@ -751,6 +848,13 @@ def to_openai_messages(messages):
                     args = fn.get("arguments") or tc.get("arguments") or tc.get("raw_arguments") or ""
                     if isinstance(args, dict):
                         args = json.dumps(args)
+                    elif isinstance(args, str):
+                        try:
+                            json.loads(args)
+                        except Exception:
+                            args = json.dumps({"command": args} if name == "bash" else {"value": args})
+                    else:
+                        args = "{}"
                     item["tool_calls"].append({
                         "id": tc.get("id") or "",
                         "type": "function",

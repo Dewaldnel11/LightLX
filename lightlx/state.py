@@ -19,6 +19,9 @@ DEFAULTS = {
         "lmstudio_url": "",
         "lmstudio_api_key": "",
         "workspace": "",
+        "brain.enabled": False,
+        "brain.idle_seconds": 900,
+        "brain.extract_model": "",
     },
 }
 

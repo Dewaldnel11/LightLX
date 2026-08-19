@@ -333,8 +333,23 @@ class Session:
 
     @property
     def ctx_limit(self):
-        # GLM-5.2 streaming engine is exact only below the DSA index_topk=2048 bound
-        return 2000 if self.is_glm else 8192
+        # Use the model's full context window (from config.json) rather than a
+        # hardcoded 8k ceiling. GLM's DSA streaming attention keeps a floor at
+        # its 2048 index_topk bound; everything else uses the advertised window.
+        cfg = {}
+        if self.model_dir:
+            try:
+                cfg = json.load(open(Path(self.model_dir) / "config.json"))
+            except Exception:
+                cfg = {}
+        n = cfg.get("max_position_embeddings") or cfg.get("max_sequence_length")
+        try:
+            n = int(n) if n else 0
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            n = 32768
+        return max(2048, n) if self.is_glm else n
 
     @property
     def is_glm(self):
@@ -450,7 +465,7 @@ def repl(sess):
                 continue
             if line in ("/exit", "/quit", "exit", "quit", "/q"):
                 return
-            if line in ("/menu", "/", "/settings"):
+            if line in ("/menu", "/settings"):
                 with bar.paused():
                     action = settings_menu(sess)
                 if action == "quit":

@@ -122,7 +122,7 @@ There are **no flags**. Everything is a numbered menu or a question.
 
 `lightlx` can talk to **any local OpenAI-compatible server** — Ollama, LM Studio,
 vLLM, llama.cpp — and run a full coding agent: files, shell, MCP, GitHub docs,
-and **parallel subagents** for long-horizon work.
+subagents, a machine-wide **brain**, and a **plan → approve** kickoff.
 
 ```
 $ lightlx
@@ -151,24 +151,59 @@ On a local MLX chat session, `/agent` switches into the full agent.
 | `list_dir` / `glob` / `grep` | Navigate the workspace |
 | `bash` | Run shell commands in the workspace |
 | `fetch_url` | Pull a web page (HTML stripped to text) |
+| `web_search` | Search the public web (DuckDuckGo); use before `fetch_url` |
 | `docs` | Read Claude Code, Codex, Ollama, MCP, or any `owner/repo` from GitHub |
 | `skill` | Load a SKILL.md (Claude / Codex / LightLX skills) |
 | `memory` | Read/write auto-memory that survives sessions |
+| `brain_search` / `brain_write` | Cross-project brain (gotchas/corrections); web facts need a URL |
 | `task` | Spawn a **subagent** (`explore` / `implement` / `general`) |
 | MCP tools | Anything you attach in `~/.lightlx/mcp.json` |
 
-Several `task` calls in one turn run **in parallel** (Ollama / LM Studio). Use
-`explore` for read-only research, `implement` to land a change, `general` for
-everything else. Subagents cannot nest.
+`task` types: `explore` (read-only research), `implement` (land a change),
+`general` (full tools). Subagents cannot nest.
+
+**One local GPU = one stream.** LM Studio (and MLX) **serialize** tool and
+`task` calls. Firing several `task`s in one turn on a single loaded model can
+drop the parent connection and leave you with no plan. Ollama / remote
+OpenAI-compat may run several in parallel. Prefer mapping the repo in this
+chat with `list_dir` / `glob` / `read_file`; if you use `task`, issue **one**,
+wait, then continue.
+
+**Kickoff (existing repo):** `/kickoff <goal>` maps this project (README, layout,
+how it runs/tests). Web search is only for unknown APIs. It **stops at a sourced
+plan** and does not edit files.
+
+Then you decide:
+
+| Command | What it does |
+|---|---|
+| `/approve` | Implement the most recent kickoff plan |
+| `/deny` | Discard it — no edits |
+
+If the model or stream returns nothing, LightLX retries once, then prints that
+**nothing is awaiting approval** instead of looking like a successful empty turn.
+
+On **implementation** turns (`/approve`, or “write/fix/implement…”), LightLX
+will not return to `›` just because the model printed a plan or dumped a file
+in chat. It injects up to **6 sequential check-ins** (“call write_file NOW”).
+If the work is still unfinished, the status is `incomplete` — not a silent
+success. Questions and `/kickoff` are not forced to edit.
 
 ```
-  ✓ subagent: map the auth flow (12 steps, 45s)
-
-› 
-░████░░░ 2.1k/32k 6%  ·  qwen3.5-9b  ·  native  ·  last 4 · 12s  ·  LightLX
+  qwen3.5-9b  ·  ctx 32768
+  /Users/you/FineArt
+  type / for commands · /help · /exit
+› /kickoff improve the composite research flow
+…
+## Plan
+1. …
+  plan is awaiting approval — /approve to implement · /deny to discard
+› /approve
 ```
 
-The last line is a sticky chat bar: context used / window / percent, model, tool mode, last-turn cost, workspace. Type on the `›` line above it.
+The default prompt is a normal terminal `›` line (replies print above it). An
+experimental sticky footer (context meter on the last row) is **off** unless you
+set `LIGHTLX_STICKY_BAR=1`. Type `/` for the command list.
 
 Docs aliases: `claude-code`, `codex`, `ollama`, `lmstudio`, `mcp`, `lightlx` —
 or pass any `owner/repo`. Example: *“read the Codex AGENTS.md and match that
@@ -210,19 +245,20 @@ Same shape as Claude Code and Codex:
 |---|---|---|
 | Project instructions | `LIGHTLX.md`, `AGENTS.md`, `CLAUDE.md`, `.lightlx/LIGHTLX.md` | Every session |
 | Personal / local | `LIGHTLX.local.md`, `~/.lightlx/LIGHTLX.md` | Every session |
-| Rules | `.lightlx/rules/*.md`, `.claude/rules/*.md` | Every session (`paths:` frontmatter = on demand later) |
+| Rules | `.lightlx/rules/*.md`, `.claude/rules/*.md` | Always, unless `paths:` — then only when those globs match |
 | Skills | `.lightlx/skills/<name>/SKILL.md`, `~/.lightlx/skills/`, plus `.claude/skills` and `.codex/skills` | Catalog always; body via `skill` or `/name` |
 | Auto memory | `~/.lightlx/memory/<project>/MEMORY.md` | Index every session; topic files on demand |
+| Cross-project brain | `~/.lightlx/brain/` (`DIGEST.md`, `corrections.md`, …) | Tiny digest every session; rest via `brain_search`. Idle extract **off** until `/brain on` |
 
 `@path` imports work inside instruction files (like Claude). Skills follow the Agent Skills `SKILL.md` layout, including `!`command`` injection.
 
-Claude and Codex skills are used as-is: LightLX reads `~/.claude/skills`, `~/.codex/skills`, and this repo’s `.claude/` / `.codex/` folders. `/import` copies or symlinks them into `~/.lightlx/skills` (or `.lightlx/skills`). A skill with `context: fork` runs as a **subagent** (same as `task`); several can run in parallel.
+Claude and Codex skills are used as-is: LightLX reads `~/.claude/skills`, `~/.codex/skills`, and this repo’s `.claude/` / `.codex/` folders. `/import` copies or symlinks them into `~/.lightlx/skills` (or `.lightlx/skills`). A skill with `context: fork` runs as a **subagent** (same as `task`). On LM Studio, do not fork several skills in one turn.
 
-`/init` writes a starter `LIGHTLX.md`. `/skills` lists skills. `/memory` shows what the agent has saved. Say “remember we use pnpm” and it writes the memory store.
+`/init` writes a starter `LIGHTLX.md`. `/skills` lists skills. `/memory` shows project notes. `/brain` prints the machine-wide store (`/brain on|off`, `/brain search Q`, `/brain digest`). `/kickoff` researches; `/approve` / `/deny` gate implementation. Say “remember we use pnpm” and it writes memory.
 
-Bundled: `/code-review`, `/summarize-changes`.
+Bundled: `/code-review`, `/summarize-changes`, `/kickoff`.
 
-Agent slash commands: `/tools` `/skills` `/memory` `/init` `/mcp` `/docs` `/workspace` `/task` `/compact` `/resume` `/save` `/handoff` `/clear` `/menu`.
+Agent slash commands: `/tools` `/skills` `/memory` `/brain` `/kickoff` `/approve` `/deny` `/init` `/mcp` `/docs` `/workspace` `/task` `/compact` `/resume` `/save` `/handoff` `/clear` `/menu`.
 
 ### Fast mode — 4-bit skeleton, no download
 
@@ -295,7 +331,7 @@ layer** — there's no small per-prompt subset to exploit. Real speed comes from
 - ✅ **Resident mode**: models that fit in RAM load fully on the GPU and run fast (like LM Studio/Ollama) — auto-selected; ~80 tok/s on Qwen2.5-0.5B.
 - ✅ **Generic engine — dense**: streams any mlx-lm dense model (Llama/Qwen/Mistral/Gemma/Phi/…) too big for RAM — verified **bit-identical** to native mlx-lm on Qwen2.
 - ✅ **Generic engine — MoE scalpel**: streams uniform-MoE models (Mixtral/Qwen2-3-MoE/OLMoE/DeepSeek/…) loading only the routed top-k experts/token — verified **bit-identical** (Δ=0) to native mlx-lm on OLMoE → coherent text.
-- ✅ **Ollama / LM Studio / OpenAI-compat**: full local agent — files, shell, MCP, GitHub docs, parallel subagents.
+- ✅ **Ollama / LM Studio / OpenAI-compat**: full local agent — files, shell, MCP, GitHub docs, subagents, brain, kickoff `/approve`/`/deny`. LM Studio serializes tools (one loaded model). Dropped/empty streams retry once, then a visible error.
 - ✅ **Conversation memory**: multi-turn history with context auto-trim, `/clear`, partial-reply capture on Ctrl-C — works in resident and streaming.
 - ✅ Runs full unquantized GLM-5.2 on a 24 GB Mac (streaming, MoE-native).
 - ✅ Streaming verified vs real shards; forward verified (finite logits, prefill
@@ -319,8 +355,9 @@ layer** — there's no small per-prompt subset to exploit. Real speed comes from
 - **Faster tier** — TB5 NVMe support; optional local 4-bit-expert quantizer.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design notes: the architecture,
-the `pread` swap fix, the MoE scalpel, the measured optimization log, and the
-performance physics.
+the `pread` swap fix, the MoE scalpel, the measured optimization log, the
+performance physics, and the local agent (LM Studio single-slot, kickoff
+`/approve` / `/deny`, default prompt vs sticky bar).
 
 ## Requirements
 
