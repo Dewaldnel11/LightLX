@@ -304,6 +304,10 @@ class Session:
         self.history = []
         self._pending_source = None
 
+    @property
+    def label(self):
+        return self.name
+
     def load(self, model_dir, announce=True):
         if announce:
             print(f"\nloading {_bold(nice_name(model_dir))} …")
@@ -631,7 +635,7 @@ def _run_agent(provider, state, native_tools=True, carry=None, source=None, work
         sess.history = list(carry.history)
         sess.session_id = getattr(carry, "session_id", None)
         old = getattr(carry, "provider", None)
-        old_label = getattr(old, "label", None) or getattr(carry, "label", None)
+        old_label = getattr(old, "label", None) or getattr(carry, "label", None) or getattr(carry, "name", None)
     if old_label and old_label != provider.label and sess.history:
         did = sess.apply_handoff(old_label)
         print(_dim(f"  handed off {old_label} → {provider.label} · ctx {sess.context_length}"
@@ -707,10 +711,11 @@ def main():
             ws = _workspace_for(state, carry)
             action, agent_sess = _run_agent(
                 _mlx_provider(sess), state, native_tools=False,
-                carry=agent_sess or carry, source=source, workspace=ws,
+                carry=agent_sess if agent_sess is not None else sess,
+                source=source, workspace=ws,
             )
         if action == "switch":
-            carry = agent_sess
+            carry = agent_sess if agent_sess is not None else sess
             source = getattr(sess, "_pending_source", None)
             if source is None:
                 source = pick_source(state, is_model_dir, lambda: pick_model(state))

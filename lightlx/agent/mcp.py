@@ -41,6 +41,8 @@ class MCPServer:
         self._lock = threading.Lock()
         self._pending = {}
         self._reader = None
+        self._stderr_thread = None
+        self._stderr_tail = ""
         self.tools = []
         self.info = {}
         self.error = None
@@ -67,12 +69,17 @@ class MCPServer:
             env=env,
             bufsize=0,
         )
+        self._stderr_tail = ""
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(self.proc.stderr,), daemon=True,
+        )
+        self._stderr_thread.start()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         result = self.request("initialize", {
             "protocolVersion": PROTOCOL,
             "capabilities": {},
-            "clientInfo": {"name": "lightlx", "version": "0.2.0"},
+            "clientInfo": {"name": "lightlx", "version": "0.2.1"},
         }, timeout=timeout)
         self.info = result or {}
         self.notify("notifications/initialized", {})
@@ -82,20 +89,41 @@ class MCPServer:
     def close(self):
         if not self.proc:
             return
+        proc = self.proc
         try:
-            if self.proc.stdin:
-                self.proc.stdin.close()
+            if proc.stdin:
+                proc.stdin.close()
         except Exception:
             pass
         try:
-            self.proc.terminate()
-            self.proc.wait(timeout=2)
+            proc.terminate()
+            proc.wait(timeout=2)
         except Exception:
             try:
-                self.proc.kill()
+                proc.kill()
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
             except Exception:
                 pass
         self.proc = None
+
+    def _drain_stderr(self, err):
+        if not err:
+            return
+        try:
+            while True:
+                chunk = err.read(4096)
+                if not chunk:
+                    return
+                text = chunk.decode("utf-8", "replace")
+                self._stderr_tail = (self._stderr_tail + text)[-8000:]
+        except Exception:
+            return
 
     def _next_id(self):
         with self._lock:

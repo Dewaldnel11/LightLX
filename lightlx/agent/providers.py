@@ -10,7 +10,7 @@ import urllib.request
 from .parse import collapse_repeats, is_repeating
 from .types import Completion, ToolCall
 
-UA = "lightlx/0.2.0"
+UA = "lightlx/0.2.1"
 DEFAULT_OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 if DEFAULT_OLLAMA and "://" not in DEFAULT_OLLAMA:
     DEFAULT_OLLAMA = "http://" + DEFAULT_OLLAMA

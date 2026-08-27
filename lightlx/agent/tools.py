@@ -82,7 +82,7 @@ def html_to_text(html: str) -> str:
 
 
 def http_get(url, timeout=30, max_bytes=1_500_000):
-    req = Request(url, headers={"User-Agent": "lightlx/0.2.0", "Accept": "*/*"})
+    req = Request(url, headers={"User-Agent": "lightlx/0.2.1", "Accept": "*/*"})
     with urlopen(req, timeout=timeout) as r:
         data = r.read(max_bytes)
         ctype = r.headers.get("Content-Type", "")

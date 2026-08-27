@@ -1,6 +1,6 @@
 [project]
 name = "lightlx"
-version = "0.2.0"
+version = "0.2.1"
 description = "Run models too big for RAM on Apple Silicon — and talk to Ollama / LM Studio with a full local agent"
 readme = "README.md"
 license = "MIT"

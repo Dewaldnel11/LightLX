@@ -16,7 +16,7 @@ from .brain import (
     import_instructions as import_brain_instructions, tick_idle,
 )
 from .prompts import DOC_ALIASES
-from .sessions import age, hydrate_messages, idle_session_paths, list_sessions, load_session, record_from, save_session, title_from
+from .sessions import age, hydrate_messages, idle_session_paths, list_sessions, load_session, project_name, record_from, save_session, title_from
 from .skills import catalog, discover_skills, expand_skill, import_skills, list_importable
 from .tools import BuiltinTools, Workspace, _short_label
 

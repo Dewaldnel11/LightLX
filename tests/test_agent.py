@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1251,5 +1252,134 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(res.status, "done")
 
 
+class ResumePickerTests(unittest.TestCase):
+    def test_pick_resume_labels_with_project_name(self):
+        from unittest.mock import patch
+        from lightlx.agent import repl
+        rows = [{
+            "workspace": "/tmp/myproj",
+            "provider": "ollama/qwen",
+            "updated": "2026-01-01T00:00:00Z",
+        }]
+        with patch("lightlx.agent.repl.list_sessions", return_value=rows), \
+             patch("builtins.input", return_value="1"), \
+             patch("builtins.print"):
+            rec = repl._pick_resume()
+        self.assertIs(rec, rows[0])
+
+
+class MlxHandoffTests(unittest.TestCase):
+    def test_run_agent_copies_chat_history_and_label(self):
+        from unittest.mock import patch
+        from lightlx import cli
+
+        class ChatSess:
+            history = [
+                {"role": "user", "content": "capital of France"},
+                {"role": "assistant", "content": "Paris"},
+            ]
+            name = "GLM-5.2"
+            label = "GLM-5.2"
+            session_id = "chat-1"
+            provider = None
+
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, *a, **k):
+                self.history = []
+                self.session_id = None
+                self.provider = type("P", (), {"label": "ollama/qwen"})()
+                self.context_length = 8192
+
+            def apply_handoff(self, old):
+                captured["old"] = old
+                return False
+
+            def persist(self):
+                captured["history"] = list(self.history)
+
+            def close(self):
+                pass
+
+        def fake_repl(sess):
+            captured["seeded"] = list(sess.history)
+            return None
+
+        with patch("lightlx.agent.repl.AgentSession", FakeAgent), \
+             patch("lightlx.agent.repl.agent_repl", fake_repl), \
+             patch("lightlx.cli.save_state"):
+            cli._run_agent(
+                type("P", (), {"label": "ollama/qwen"})(),
+                {"prefs": {}},
+                carry=ChatSess(),
+                workspace="/tmp",
+            )
+        self.assertEqual(captured["old"], "GLM-5.2")
+        self.assertEqual(captured["seeded"][0]["content"], "capital of France")
+        self.assertEqual(len(captured["seeded"]), 2)
+
+    def test_session_label_follows_name(self):
+        from lightlx.cli import Session
+        s = Session({"prefs": {}})
+        s.name = "GLM-5.2"
+        self.assertEqual(s.label, "GLM-5.2")
+
+
+class MCPStderrTests(unittest.TestCase):
+    def test_noisy_stderr_does_not_deadlock(self):
+        from lightlx.agent.mcp import MCPServer
+        tmp = tempfile.TemporaryDirectory()
+        script = Path(tmp.name) / "noisy_mcp.py"
+        script.write_text(
+            "import json, sys\n"
+            "sys.stderr.write('warn\\n' * 50000)\n"
+            "sys.stderr.flush()\n"
+            "def read_msg():\n"
+            "    headers = {}\n"
+            "    while True:\n"
+            "        line = sys.stdin.buffer.readline()\n"
+            "        if not line:\n"
+            "            return None\n"
+            "        if line in (b'\\r\\n', b'\\n'):\n"
+            "            break\n"
+            "        if b':' in line:\n"
+            "            k, v = line.decode().split(':', 1)\n"
+            "            headers[k.strip().lower()] = v.strip()\n"
+            "    n = int(headers.get('content-length') or 0)\n"
+            "    return json.loads(sys.stdin.buffer.read(n))\n"
+            "def write_msg(msg):\n"
+            "    data = json.dumps(msg).encode()\n"
+            "    sys.stdout.buffer.write(f'Content-Length: {len(data)}\\r\\n\\r\\n'.encode() + data)\n"
+            "    sys.stdout.buffer.flush()\n"
+            "while True:\n"
+            "    msg = read_msg()\n"
+            "    if msg is None:\n"
+            "        break\n"
+            "    mid = msg.get('id')\n"
+            "    if mid is None:\n"
+            "        continue\n"
+            "    method = msg.get('method')\n"
+            "    if method == 'initialize':\n"
+            "        write_msg({'jsonrpc': '2.0', 'id': mid, 'result': {"
+            "'protocolVersion': '2024-11-05', 'capabilities': {},"
+            "'serverInfo': {'name': 'noisy'}}})\n"
+            "    elif method == 'tools/list':\n"
+            "        write_msg({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': []}})\n"
+            "    else:\n"
+            "        write_msg({'jsonrpc': '2.0', 'id': mid, 'result': {}})\n"
+        )
+        srv = MCPServer("noisy", {"command": sys.executable, "args": [str(script)]}, tmp.name)
+        try:
+            srv.start(timeout=8)
+            self.assertEqual(srv.info.get("serverInfo", {}).get("name"), "noisy")
+            self.assertEqual(srv.tools, [])
+            self.assertIn("warn", srv._stderr_tail)
+        finally:
+            srv.close()
+            tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
+
